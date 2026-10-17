@@ -1,4 +1,10 @@
 use super::*;
+use crate::deferred_input::CapturedInput;
+use gpui::{
+    ClipboardReadError, ClipboardReadMode, ClipboardRevision, ClipboardSnapshot,
+    ClipboardSnapshotRead,
+};
+use std::rc::Weak;
 use util::rel_path::RelPath;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -56,7 +62,353 @@ impl ClipboardSelection {
     }
 }
 
+#[derive(Default)]
+pub(super) struct ClipboardChannels {
+    clipboard: RefCell<Weak<RefCell<ClipboardState>>>,
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    primary: RefCell<Weak<RefCell<ClipboardState>>>,
+}
+
+impl Global for ClipboardChannels {}
+
+#[derive(Default)]
+pub(super) struct DeferredClipboard {
+    state: Rc<RefCell<ClipboardState>>,
+}
+
+#[derive(Clone)]
+pub(super) struct CapturedClipboardAction {
+    state: Rc<RefCell<ClipboardState>>,
+    preceding_write: Option<Rc<ClipboardWrite>>,
+    mode: ClipboardReadMode,
+    snapshot: ClipboardSnapshotRead,
+    value: Rc<RefCell<Option<Result<CapturedClipboardValue, ClipboardReadError>>>>,
+}
+
+#[derive(Clone)]
+struct CapturedClipboardValue {
+    snapshot: Result<Arc<ClipboardSnapshot>, ClipboardReadError>,
+    provenance: Option<ClipboardProvenance>,
+}
+
+impl CapturedClipboardAction {
+    pub(super) fn is_ready(&self, mode: ClipboardReadMode) -> bool {
+        if !self.snapshot.revision_only().is_ready() {
+            return false;
+        }
+        mode == ClipboardReadMode::RevisionOnly
+            || self.mode != ClipboardReadMode::Contents
+            || self
+                .value()
+                .and_then(|value| self.logical_write(&value))
+                .map_or(true, |write| write.is_some())
+            || self.snapshot.is_ready()
+    }
+
+    pub(super) async fn wait(&self, mode: ClipboardReadMode) -> Result<()> {
+        self.snapshot.revision_only().wait().await?;
+        if !self.is_ready(mode) {
+            self.snapshot.wait().await?;
+        }
+        self.check_ready(mode)
+    }
+
+    pub(super) fn check_ready(&self, mode: ClipboardReadMode) -> Result<()> {
+        if mode == ClipboardReadMode::Contents {
+            self.with_item(|_| ())
+        } else {
+            self.value().map(|_| ())
+        }
+    }
+
+    fn logical_write(&self, value: &CapturedClipboardValue) -> Result<Option<Rc<ClipboardWrite>>> {
+        if let Some(last_write) = self.state.borrow().last_write.as_ref()
+            && !self
+                .preceding_write
+                .as_ref()
+                .is_some_and(|preceding_write| Rc::ptr_eq(preceding_write, last_write))
+        {
+            match last_write
+                .provenance
+                .as_ref()
+                .zip(value.provenance.as_ref())
+                .and_then(|(write, capture)| write.same_epoch(capture))
+            {
+                Some(true) => return Ok(Some(last_write.clone())),
+                Some(false) => {}
+                None => anyhow::bail!("Clipboard ordering is unavailable; paste was cancelled"),
+            }
+        }
+        Ok(None)
+    }
+
+    fn with_item<R>(&self, read: impl FnOnce(Option<&ClipboardItem>) -> R) -> Result<R> {
+        let value = self.value()?;
+        if let Some(write) = self.logical_write(&value)? {
+            return write
+                .item
+                .as_ref()
+                .map(|item| read(Some(item)))
+                .map_err(|error| anyhow::anyhow!(error.to_string()));
+        }
+        anyhow::ensure!(
+            self.mode == ClipboardReadMode::Contents,
+            "Clipboard contents were not captured"
+        );
+        Ok(read(value.snapshot?.item.as_ref()))
+    }
+
+    fn value(&self) -> Result<CapturedClipboardValue> {
+        self.value
+            .borrow()
+            .as_ref()
+            .context("Clipboard snapshot is not ready")?
+            .clone()
+            .map_err(anyhow::Error::new)
+    }
+}
+
+#[derive(Clone, Default)]
+struct ClipboardProvenance {
+    segment: Rc<()>,
+    epoch: Rc<()>,
+}
+
+#[derive(Default)]
+struct ClipboardState {
+    revision: Option<ClipboardRevision>,
+    provenance: ClipboardProvenance,
+    last_write: Option<Rc<ClipboardWrite>>,
+}
+
+struct ClipboardWrite {
+    item: Result<ClipboardItem, Arc<str>>,
+    provenance: Option<ClipboardProvenance>,
+}
+
+impl ClipboardChannels {
+    fn clipboard(&self) -> DeferredClipboard {
+        DeferredClipboard::for_channel(&self.clipboard)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn primary(&self) -> DeferredClipboard {
+        DeferredClipboard::for_channel(&self.primary)
+    }
+}
+
+impl ClipboardProvenance {
+    fn same_epoch(&self, other: &Self) -> Option<bool> {
+        Rc::ptr_eq(&self.segment, &other.segment).then(|| Rc::ptr_eq(&self.epoch, &other.epoch))
+    }
+}
+
+impl ClipboardState {
+    fn observe(&mut self, revision: Option<ClipboardRevision>) -> Option<ClipboardProvenance> {
+        let revision = revision?;
+        if self.revision.as_ref() != Some(&revision) {
+            self.provenance.epoch = Rc::new(());
+            self.revision = Some(revision);
+        }
+        Some(self.provenance.clone())
+    }
+
+    fn lose_continuity(&mut self) {
+        self.revision = None;
+        self.provenance = ClipboardProvenance::default();
+    }
+}
+
+impl DeferredClipboard {
+    fn for_channel(channel: &RefCell<Weak<RefCell<ClipboardState>>>) -> Self {
+        let mut channel = channel.borrow_mut();
+        let state = channel.upgrade().unwrap_or_else(|| {
+            let state = Rc::new(RefCell::new(ClipboardState::default()));
+            *channel = Rc::downgrade(&state);
+            state
+        });
+        Self { state }
+    }
+
+    fn capture<S: Into<ClipboardSnapshotRead>>(
+        &self,
+        captured: Option<&CapturedClipboardAction>,
+        mode: ClipboardReadMode,
+        read: impl FnOnce(ClipboardReadMode) -> S,
+    ) -> CapturedClipboardAction {
+        captured
+            .filter(|captured| Rc::ptr_eq(&captured.state, &self.state))
+            .cloned()
+            .unwrap_or_else(|| {
+                let preceding_write = self.state.borrow().last_write.clone();
+                let snapshot = read(mode).into();
+                let value = Rc::new(RefCell::new(None));
+                snapshot.revision_only().on_ready({
+                    let state = self.state.clone();
+                    let value = value.clone();
+                    move |snapshot| {
+                        *value.borrow_mut() =
+                            Some(snapshot.map(|snapshot| CapturedClipboardValue {
+                                provenance: state.borrow_mut().observe(snapshot.revision.clone()),
+                                snapshot: Err(ClipboardReadError::UnsupportedContent),
+                            }));
+                    }
+                });
+                if mode == ClipboardReadMode::Contents {
+                    snapshot.on_ready({
+                        let value = value.clone();
+                        move |snapshot| {
+                            if let Some(Ok(value)) = value.borrow_mut().as_mut() {
+                                value.snapshot = snapshot;
+                            }
+                        }
+                    });
+                }
+                CapturedClipboardAction {
+                    state: self.state.clone(),
+                    preceding_write,
+                    mode,
+                    snapshot,
+                    value,
+                }
+            })
+    }
+
+    fn read(
+        &self,
+        captured: Option<&CapturedClipboardAction>,
+        read: impl FnOnce() -> Option<ClipboardItem>,
+    ) -> Result<Option<ClipboardItem>> {
+        let Some(captured) = captured.filter(|captured| Rc::ptr_eq(&captured.state, &self.state))
+        else {
+            return Ok(read());
+        };
+        captured.with_item(|item| item.cloned())
+    }
+
+    fn write(
+        &self,
+        captured: Option<&CapturedClipboardAction>,
+        item: ClipboardItem,
+        revision: impl FnOnce() -> Option<ClipboardRevision>,
+        publish: impl FnOnce(ClipboardItem) -> Result<Option<ClipboardRevision>>,
+    ) -> Result<()> {
+        let revision = revision();
+        let mut state = self.state.borrow_mut();
+        let current = state.observe(revision);
+        let captured = captured.filter(|captured| Rc::ptr_eq(&captured.state, &self.state));
+        let provenance = match captured {
+            Some(captured) => captured.value()?.provenance,
+            None => current.clone(),
+        };
+        let superseded = provenance
+            .as_ref()
+            .is_some_and(|origin| origin.same_epoch(&state.provenance) == Some(false));
+        let can_publish = captured.is_none()
+            || provenance
+                .as_ref()
+                .zip(current.as_ref())
+                .is_some_and(|(origin, current)| origin.same_epoch(current) == Some(true));
+        drop(state);
+
+        let result = if superseded {
+            Ok(())
+        } else if can_publish {
+            self.did_publish(publish(item.clone()))
+        } else {
+            Err(anyhow::anyhow!(
+                "Clipboard ordering is unavailable; copy was cancelled"
+            ))
+        };
+        self.record_write(item, provenance, result)
+    }
+
+    fn did_publish(&self, result: Result<Option<ClipboardRevision>>) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+        match result {
+            Ok(Some(revision)) => {
+                state.revision = Some(revision);
+                Ok(())
+            }
+            Ok(None) => {
+                state.lose_continuity();
+                Ok(())
+            }
+            Err(error) => {
+                state.lose_continuity();
+                Err(error)
+            }
+        }
+    }
+
+    fn record_write(
+        &self,
+        item: ClipboardItem,
+        provenance: Option<ClipboardProvenance>,
+        result: Result<()>,
+    ) -> Result<()> {
+        self.state.borrow_mut().last_write = Some(Rc::new(ClipboardWrite {
+            item: result
+                .as_ref()
+                .map(|()| item)
+                .map_err(|error| Arc::from(format!("{error:#}"))),
+            provenance,
+        }));
+        result
+    }
+}
+
 impl Editor {
+    pub fn read_from_clipboard(&self, cx: &App) -> Result<Option<ClipboardItem>> {
+        cx.global::<ClipboardChannels>().clipboard().read(
+            CapturedInput::current(cx).and_then(|input| input.clipboard.as_ref()),
+            || cx.read_from_clipboard(),
+        )
+    }
+
+    pub fn write_to_clipboard(&mut self, item: ClipboardItem, cx: &mut App) -> Result<()> {
+        if self.input_is_replaying() {
+            let clipboard = cx.global::<ClipboardChannels>().clipboard();
+            clipboard.write(
+                CapturedInput::current(cx).and_then(|input| input.clipboard.as_ref()),
+                item,
+                || {
+                    cx.read_clipboard_snapshot(ClipboardReadMode::RevisionOnly)
+                        .revision
+                },
+                |item| cx.write_to_clipboard_with_revision(item),
+            )
+        } else {
+            cx.write_to_clipboard_with_revision(item).map(|_| ())
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn read_from_primary(&self, cx: &App) -> Result<Option<ClipboardItem>> {
+        cx.global::<ClipboardChannels>().primary().read(
+            CapturedInput::current(cx).and_then(|input| input.primary.as_ref()),
+            || cx.read_from_primary(),
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn write_to_primary(&mut self, item: ClipboardItem, cx: &mut App) -> Result<()> {
+        if self.input_is_replaying() {
+            let primary = cx.global::<ClipboardChannels>().primary();
+            primary.write(
+                CapturedInput::current(cx).and_then(|input| input.primary.as_ref()),
+                item,
+                || {
+                    cx.read_primary_snapshot(ClipboardReadMode::RevisionOnly)
+                        .revision
+                },
+                |item| cx.write_to_primary_with_revision(item),
+            )
+        } else {
+            cx.write_to_primary_with_revision(item).map(|_| ())
+        }
+    }
+
     pub fn do_paste(
         &mut self,
         text: &String,
@@ -65,6 +417,17 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.input_is_deferred(cx) {
+            let text = text.clone();
+            self.defer_input(
+                move |editor, window, cx| {
+                    editor.do_paste(&text, clipboard_selections, handle_entire_lines, window, cx);
+                },
+                window,
+                cx,
+            );
+            return;
+        }
         if self.read_only(cx) {
             return;
         }
@@ -249,9 +612,20 @@ impl Editor {
         });
     }
 
-    pub fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(item) = cx.read_from_clipboard() {
-            self.paste_item(&item, window, cx);
+    pub fn paste(&mut self, action: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_clipboard_action_with_access(
+            ClipboardAccess::Read,
+            action,
+            Self::paste,
+            window,
+            cx,
+        ) {
+            return;
+        }
+        match self.read_from_clipboard(cx) {
+            Ok(Some(item)) => self.paste_item(&item, window, cx),
+            Ok(None) => {}
+            Err(error) => self.notify_clipboard_error(error, cx),
         }
     }
 
@@ -261,6 +635,15 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.input_is_deferred(cx) {
+            let item = item.clone();
+            self.defer_input(
+                move |editor, window, cx| editor.paste_item(&item, window, cx),
+                window,
+                cx,
+            );
+            return;
+        }
         if self.read_only(cx) {
             return;
         }
@@ -343,6 +726,15 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.input_is_deferred(cx) {
+            let filename = filename.to_owned();
+            self.defer_input(
+                move |editor, window, cx| editor.insert_image_snippet(&filename, window, cx),
+                window,
+                cx,
+            );
+            return;
+        }
         let Some(snippet) = Snippet::parse(&format!("![$1]({filename})$0")).log_err() else {
             return;
         };
@@ -357,23 +749,136 @@ impl Editor {
             .log_err();
     }
 
-    pub(super) fn cut_common(
+    pub(super) fn publish_clipboard_item(
         &mut self,
-        cut_no_selection_line: bool,
-        window: &mut Window,
+        item: ClipboardItem,
+        window: &Window,
         cx: &mut Context<Self>,
-    ) -> ClipboardItem {
+    ) {
+        self.bind_input_window(window);
+        let captured = self.capture_clipboard(ClipboardReadMode::RevisionOnly, cx);
+        if self.shared_input_is_deferred() || !captured.is_ready(ClipboardReadMode::RevisionOnly) {
+            self.defer_clipboard_publication(
+                NativeInput {
+                    clipboard: Some(ClipboardAccess::Write),
+                    ..NativeInput::default()
+                },
+                CapturedInput {
+                    clipboard: Some(captured),
+                    ..CapturedInput::default()
+                },
+                move |editor, _, cx| {
+                    editor.publish_prepared_item(item, cx);
+                },
+                cx,
+            );
+        } else if let Err(error) = captured.check_ready(ClipboardReadMode::RevisionOnly) {
+            self.notify_clipboard_error(error, cx);
+        } else {
+            self.publish_prepared_item(item, cx);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub(super) fn publish_primary_item(
+        &mut self,
+        item: ClipboardItem,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.bind_input_window(window);
+        let captured = self.capture_primary(ClipboardReadMode::RevisionOnly, cx);
+        if self.shared_input_is_deferred() || !captured.is_ready(ClipboardReadMode::RevisionOnly) {
+            self.defer_clipboard_publication(
+                NativeInput {
+                    primary: Some(ClipboardAccess::Write),
+                    ..NativeInput::default()
+                },
+                CapturedInput {
+                    primary: Some(captured),
+                    ..CapturedInput::default()
+                },
+                move |editor, _, cx| {
+                    if let Err(error) = editor.write_to_primary(item, cx) {
+                        editor.notify_clipboard_error(error, cx);
+                    }
+                },
+                cx,
+            );
+        } else if let Err(error) = captured
+            .check_ready(ClipboardReadMode::RevisionOnly)
+            .and_then(|()| self.write_to_primary(item, cx))
+        {
+            self.notify_clipboard_error(error, cx);
+        }
+    }
+
+    pub(super) fn capture_clipboard(
+        &self,
+        mode: ClipboardReadMode,
+        cx: &App,
+    ) -> CapturedClipboardAction {
+        cx.global::<ClipboardChannels>().clipboard().capture(
+            CapturedInput::current(cx).and_then(|input| input.clipboard.as_ref()),
+            mode,
+            |mode| {
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(capture) = cx.try_global::<crate::test::NativeClipboardCapture>() {
+                    return (capture.0)(false, mode);
+                }
+                cx.capture_clipboard_snapshot(mode)
+            },
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub(super) fn capture_primary(
+        &self,
+        mode: ClipboardReadMode,
+        cx: &App,
+    ) -> CapturedClipboardAction {
+        cx.global::<ClipboardChannels>().primary().capture(
+            CapturedInput::current(cx).and_then(|input| input.primary.as_ref()),
+            mode,
+            |mode| {
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(capture) = cx.try_global::<crate::test::NativeClipboardCapture>() {
+                    return (capture.0)(true, mode);
+                }
+                cx.capture_primary_snapshot(mode)
+            },
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub(super) fn read_captured_primary(
+        &self,
+        captured: &CapturedClipboardAction,
+        cx: &App,
+    ) -> Result<Option<ClipboardItem>> {
+        cx.global::<ClipboardChannels>()
+            .primary()
+            .read(Some(captured), || cx.read_from_primary())
+    }
+
+    pub(super) fn prepare_cut(
+        &self,
+        cut_no_selection_line: bool,
+        selections: &SelectionsCollection,
+        snapshot: &DisplaySnapshot,
+        cx: &App,
+    ) -> (ClipboardItem, Vec<Selection<Point>>) {
         let mut text = String::new();
-        let buffer = self.buffer.read(cx).snapshot(cx);
-        let mut selections = self.selections.all::<Point>(&self.display_snapshot(cx));
+        let buffer = snapshot.buffer_snapshot();
+        let line_mode = selections.line_mode();
+        let mut selections = selections.all::<Point>(snapshot);
         let mut clipboard_selections = Vec::with_capacity(selections.len());
         {
             let max_point = buffer.max_point();
             let mut is_first = true;
             let mut prev_selection_was_entire_line = false;
             for selection in &mut selections {
-                let is_entire_line =
-                    (selection.is_empty() && cut_no_selection_line) || self.selections.line_mode();
+                let is_entire_line = (selection.is_empty() && cut_no_selection_line) || line_mode;
                 if is_entire_line {
                     selection.start = Point::new(selection.start.row, 0);
                     if !selection.is_empty() && selection.end.column == 0 {
@@ -399,36 +904,97 @@ impl Editor {
                     len,
                     is_entire_line,
                     selection.range(),
-                    &buffer,
+                    buffer,
                     self.project.as_ref(),
                     cx,
                 ));
             }
         }
 
-        self.transact(window, cx, |this, window, cx| {
-            this.change_selections(Default::default(), window, cx, |s| {
-                s.select(selections);
-            });
-            this.insert("", window, cx);
-        });
-        ClipboardItem::new_string_with_json_metadata(text, clipboard_selections)
+        (
+            ClipboardItem::new_string_with_json_metadata(text, clipboard_selections),
+            selections,
+        )
     }
 
-    pub(super) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn delete_cut_ranges(
+        &mut self,
+        selections: Vec<Selection<Point>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.transact(window, cx, |editor, window, cx| {
+            editor.change_selections(
+                SelectionEffects::default(),
+                window,
+                cx,
+                |selections_to_change| {
+                    selections_to_change.select(selections);
+                },
+            );
+            editor.insert("", window, cx);
+        });
+    }
+
+    pub(super) fn cut(&mut self, action: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_clipboard_action(action, Self::cut, window, cx) {
+            return;
+        }
         if self.read_only(cx) {
             return;
         }
-        let item = self.cut_common(true, window, cx);
-        cx.write_to_clipboard(item);
+        let snapshot = self.display_snapshot(cx);
+        let (item, selections) = self.prepare_cut(true, &self.selections, &snapshot, cx);
+        self.publish_cut(item, selections, window, cx);
+    }
+
+    pub(super) fn publish_cut(
+        &mut self,
+        item: ClipboardItem,
+        selections: Vec<Selection<Point>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.write_prepared_item(item, cx) {
+            Ok(None) => self.delete_cut_ranges(selections, window, cx),
+            Ok(Some(task)) => {
+                let snapshot = self.buffer.read(cx).snapshot(cx);
+                let selections = selections
+                    .into_iter()
+                    .map(|selection| Selection {
+                        start: snapshot.anchor_after(selection.start),
+                        end: snapshot.anchor_before(selection.end),
+                        id: selection.id,
+                        reversed: selection.reversed,
+                        goal: selection.goal,
+                    })
+                    .collect::<Vec<_>>();
+                self.defer_clipboard_write(
+                    task,
+                    Some(Box::new(move |editor, window, cx| {
+                        let snapshot = editor.buffer.read(cx).snapshot(cx);
+                        let selections = selections
+                            .into_iter()
+                            .map(|selection| selection.map(|anchor| anchor.to_point(&snapshot)))
+                            .collect();
+                        editor.delete_cut_ranges(selections, window, cx);
+                    })),
+                    cx,
+                );
+            }
+            Err(error) => self.notify_clipboard_error(error, cx),
+        }
     }
 
     pub(super) fn kill_ring_cut(
         &mut self,
-        _: &KillRingCut,
+        action: &KillRingCut,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_action(action, Self::kill_ring_cut, window, cx) {
+            return;
+        }
         if self.read_only(cx) {
             return;
         }
@@ -458,7 +1024,9 @@ impl Editor {
                 }
             });
         });
-        let item = self.cut_common(false, window, cx);
+        let snapshot = self.display_snapshot(cx);
+        let (item, selections) = self.prepare_cut(false, &self.selections, &snapshot, cx);
+        self.delete_cut_ranges(selections, window, cx);
 
         let Some(item_text) = item.text() else {
             return;
@@ -513,10 +1081,13 @@ impl Editor {
 
     pub(super) fn kill_ring_yank(
         &mut self,
-        _: &KillRingYank,
+        action: &KillRingYank,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_action(action, Self::kill_ring_yank, window, cx) {
+            return;
+        }
         if !cx.has_global::<KillRing>() {
             return;
         }
@@ -531,23 +1102,38 @@ impl Editor {
 
     pub(super) fn copy_and_trim(
         &mut self,
-        _: &CopyAndTrim,
-        _: &mut Window,
+        action: &CopyAndTrim,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_clipboard_action(action, Self::copy_and_trim, window, cx) {
+            return;
+        }
         self.do_copy(true, cx);
     }
 
-    pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn copy(&mut self, action: &Copy, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_clipboard_action(action, Self::copy, window, cx) {
+            return;
+        }
         self.do_copy(false, cx);
     }
 
     pub(super) fn diff_clipboard_with_selection(
         &mut self,
-        _: &DiffClipboardWithSelection,
+        action: &DiffClipboardWithSelection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_clipboard_action_with_access(
+            ClipboardAccess::Read,
+            action,
+            Self::diff_clipboard_with_selection,
+            window,
+            cx,
+        ) {
+            return;
+        }
         let selections = self
             .selections
             .all::<MultiBufferOffset>(&self.display_snapshot(cx));
@@ -557,7 +1143,14 @@ impl Editor {
             return;
         };
 
-        let clipboard_text = cx.read_from_clipboard().and_then(|item| {
+        let item = match self.read_from_clipboard(cx) {
+            Ok(item) => item,
+            Err(error) => {
+                self.notify_clipboard_error(error, cx);
+                return;
+            }
+        };
+        let clipboard_text = item.and_then(|item| {
             item.entries().iter().find_map(|entry| match entry {
                 ClipboardEntry::String(text) => Some(text.text().to_string()),
                 _ => None,
@@ -578,7 +1171,41 @@ impl Editor {
         );
     }
 
-    fn do_copy(&self, strip_leading_indents: bool, cx: &mut Context<Self>) {
+    fn write_prepared_item(
+        &mut self,
+        item: ClipboardItem,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<Task<Result<()>>>> {
+        let publication =
+            cfg!(target_family = "wasm").then(|| cx.write_to_clipboard_async(item.clone()));
+        #[cfg(test)]
+        let publication = cx
+            .try_global::<tests::TestClipboardPublication>()
+            .map(|publication| publication.0(&item))
+            .or(publication);
+        let Some(publication) = publication else {
+            return self.write_to_clipboard(item, cx).map(|()| None);
+        };
+        let clipboard = cx.global::<ClipboardChannels>().clipboard();
+        let provenance = clipboard.state.borrow_mut().observe(
+            cx.read_clipboard_snapshot(ClipboardReadMode::RevisionOnly)
+                .revision,
+        );
+        Ok(Some(cx.foreground_executor().spawn(async move {
+            let result = clipboard.did_publish(publication.await);
+            clipboard.record_write(item, provenance, result)
+        })))
+    }
+
+    fn publish_prepared_item(&mut self, item: ClipboardItem, cx: &mut Context<Self>) {
+        match self.write_prepared_item(item, cx) {
+            Ok(Some(task)) => self.defer_clipboard_write(task, None, cx),
+            Ok(None) => {}
+            Err(error) => self.notify_clipboard_error(error, cx),
+        }
+    }
+
+    fn do_copy(&mut self, strip_leading_indents: bool, cx: &mut Context<Self>) {
         let selections = self.selections.all::<Point>(&self.display_snapshot(cx));
         let buffer = self.buffer.read(cx).read(cx);
         let mut text = String::new();
@@ -673,10 +1300,11 @@ impl Editor {
             ));
         }
 
-        cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
-            text,
-            clipboard_selections,
-        ));
+        drop(buffer);
+        self.publish_prepared_item(
+            ClipboardItem::new_string_with_json_metadata(text, clipboard_selections),
+            cx,
+        );
     }
 }
 
@@ -760,4 +1388,2095 @@ fn is_standalone_url(text: &str) -> bool {
         .links(text)
         .next()
         .is_some_and(|link| link.start() == 0 && link.end() == text.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{editor_tests::init_test, test::editor_test_context::EditorTestContext};
+    use fs::Fs as _;
+    use futures::channel::oneshot;
+    use gpui::{
+        ClipboardSnapshot, ClipboardSnapshotResolver, KeyBinding, Keystroke, TestAppContext,
+    };
+    use language::language_settings::SoftWrap;
+    use project::FakeFs;
+    use util::{path, rel_path::rel_path};
+    use workspace::{OpenOptions, SaveIntent, item::Item};
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_overlay_lives_only_with_captures(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let mut editor_cx = EditorTestContext::new(cx).await;
+        let (capture, completion) = editor_cx.update_editor(|editor, window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(String::from("Z")));
+            let capture = editor.capture_clipboard(ClipboardReadMode::Contents, cx);
+            let editor_handle = cx.weak_entity();
+            editor.schedule_input_continuation(window, cx, move |_, cx| {
+                editor_handle
+                    .update(cx, |editor, cx| {
+                        editor
+                            .write_to_clipboard(
+                                ClipboardItem::new_string(String::from("outgoing")),
+                                cx,
+                            )
+                            .expect("publication");
+                    })
+                    .expect("editor");
+            });
+            (capture, editor.input_completion(cx))
+        });
+        cx.run_until_parked();
+        completion
+            .now_or_never()
+            .expect("publication completed")
+            .expect("publication succeeded");
+        let state = Rc::downgrade(&capture.state);
+        let write = Rc::downgrade(
+            capture
+                .state
+                .borrow()
+                .last_write
+                .as_ref()
+                .expect("last write"),
+        );
+        editor_cx.update_editor(|editor, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(String::from("external")));
+            CapturedInput {
+                clipboard: Some(capture.clone()),
+                ..CapturedInput::default()
+            }
+            .run(cx, |cx| {
+                assert_eq!(
+                    editor
+                        .read_from_clipboard(cx)
+                        .expect("captured read")
+                        .and_then(|item| item.text()),
+                    Some(String::from("outgoing")),
+                );
+            });
+        });
+        drop(capture);
+        assert!(state.upgrade().is_none());
+        assert!(write.upgrade().is_none());
+        editor_cx.update_editor(|editor, _, cx| {
+            let captured = editor.capture_clipboard(ClipboardReadMode::Contents, cx);
+            assert_eq!(
+                captured
+                    .value()
+                    .expect("resolved capture")
+                    .snapshot
+                    .expect("captured contents")
+                    .item
+                    .as_ref()
+                    .and_then(|item| item.text()),
+                Some(String::from("external"))
+            );
+        });
+    }
+
+    #[test]
+    fn test_deferred_clipboard_observes_external_writes() {
+        for (external, after_paste, expected) in [
+            (&[][..], false, "A"),
+            (&["B"][..], false, "B"),
+            (&["Z"][..], false, "Z"),
+            (&["Y", "Z"][..], false, "Z"),
+            (&[][..], true, "A"),
+        ] {
+            let clipboard = DeferredClipboard::default();
+            let native = RefCell::new(clipboard_snapshot(Some("Z")));
+            let copy = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+                native.borrow().clone()
+            });
+            for text in external {
+                publish_clipboard(&native, ClipboardItem::new_string((*text).to_owned()))
+                    .expect("external publication");
+            }
+            let paste = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+                native.borrow().clone()
+            });
+            if after_paste {
+                publish_clipboard(&native, ClipboardItem::new_string(String::from("late")))
+                    .expect("late publication");
+            }
+            clipboard
+                .write(
+                    Some(&copy),
+                    ClipboardItem::new_string(String::from("A")),
+                    || native.borrow().revision.clone(),
+                    |item| publish_clipboard(&native, item),
+                )
+                .expect("deferred publication");
+            assert_eq!(
+                clipboard
+                    .read(Some(&paste), || panic!("paste reread clipboard"))
+                    .expect("captured clipboard read")
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some(expected),
+                "external={external:?}, after_paste={after_paste}",
+            );
+            assert_eq!(
+                native
+                    .borrow()
+                    .item
+                    .as_ref()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some(if after_paste { "late" } else { expected }),
+            );
+        }
+    }
+
+    #[test]
+    fn test_deferred_clipboard_pending_observations_precede_publication() {
+        for external_before_paste in [false, true] {
+            let clipboard = DeferredClipboard::default();
+            let native = RefCell::new(clipboard_snapshot(Some("Z")));
+            let (read, copy_resolver) = ClipboardSnapshotRead::pending();
+            let copy = clipboard.capture(None, ClipboardReadMode::Contents, |_| read);
+            let (read, paste_resolver) = ClipboardSnapshotRead::pending();
+            let paste = clipboard.capture(None, ClipboardReadMode::Contents, |_| read);
+            assert!(!copy.is_ready(ClipboardReadMode::Contents));
+            assert!(!paste.is_ready(ClipboardReadMode::Contents));
+            copy_resolver.resolve_revision(native.borrow().revision.clone());
+            assert!(copy.is_ready(ClipboardReadMode::RevisionOnly));
+            assert!(!copy.is_ready(ClipboardReadMode::Contents));
+            if external_before_paste {
+                publish_clipboard(&native, ClipboardItem::new_string(String::from("external")))
+                    .expect("external publication");
+            }
+            let captured = native.borrow().clone();
+            paste_resolver.resolve_revision(captured.revision.clone());
+            assert!(paste.is_ready(ClipboardReadMode::RevisionOnly));
+            assert!(!paste.is_ready(ClipboardReadMode::Contents));
+            assert_eq!(clipboard.state.borrow().revision, native.borrow().revision);
+            clipboard
+                .write(
+                    Some(&copy),
+                    ClipboardItem::new_string(String::from("copy")),
+                    || native.borrow().revision.clone(),
+                    |item| publish_clipboard(&native, item),
+                )
+                .expect("ordered publication");
+            assert_eq!(
+                paste.is_ready(ClipboardReadMode::Contents),
+                !external_before_paste
+            );
+            if external_before_paste {
+                paste_resolver.resolve(Ok(Arc::new(captured)));
+            } else {
+                paste
+                    .wait(ClipboardReadMode::Contents)
+                    .now_or_never()
+                    .expect("logical write does not wait for native payload")
+                    .expect("logical write is ready");
+                paste_resolver.resolve(Err(ClipboardReadError::Unavailable));
+            }
+            assert_eq!(clipboard.state.borrow().revision, native.borrow().revision);
+            assert_eq!(
+                clipboard
+                    .read(Some(&paste), || panic!("reread pending snapshot"))
+                    .expect("paste")
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some(if external_before_paste {
+                    "external"
+                } else {
+                    "copy"
+                }),
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_cut_supersedes_failed_payload(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        for external_before_paste in [false, true] {
+            let mut editor_cx = EditorTestContext::new(cx).await;
+            editor_cx.set_state("«Xˇ»");
+            let (read, resolver) = ClipboardSnapshotRead::pending();
+            let (native, completion) = editor_cx.update_editor(|editor, window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(String::from("initial")));
+                let native = cx.read_clipboard_snapshot(ClipboardReadMode::RevisionOnly);
+                let channel = cx.global::<ClipboardChannels>().clipboard();
+                let capture = channel.capture(None, ClipboardReadMode::RevisionOnly, |_| read);
+                CapturedInput {
+                    clipboard: Some(capture),
+                    ..CapturedInput::default()
+                }
+                .run(cx, |cx| editor.cut(&Cut, window, cx));
+                if external_before_paste {
+                    cx.write_to_clipboard(ClipboardItem::new_string(String::from("external")));
+                }
+                let revision = cx
+                    .read_clipboard_snapshot(ClipboardReadMode::RevisionOnly)
+                    .revision;
+                let (read, resolver) = ClipboardSnapshotRead::pending();
+                let capture = channel.capture(None, ClipboardReadMode::Contents, |_| read);
+                resolver.resolve_with_revision(Err(ClipboardReadError::Unavailable), revision);
+                CapturedInput {
+                    clipboard: Some(capture),
+                    ..CapturedInput::default()
+                }
+                .run(cx, |cx| editor.paste(&Paste, window, cx));
+                (native, editor.input_completion(cx))
+            });
+            cx.run_until_parked();
+            editor_cx.assert_editor_state("«Xˇ»");
+            resolver.resolve(Ok(Arc::new(native)));
+            if external_before_paste {
+                completion
+                    .await
+                    .expect_err("external payload remains unavailable");
+                editor_cx.assert_editor_state("ˇ");
+            } else {
+                completion.await.expect("paste uses the preceding cut");
+                editor_cx.assert_editor_state("Xˇ");
+            }
+            editor_cx.update(|_, cx| {
+                assert_eq!(
+                    cx.read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .as_deref(),
+                    Some(if external_before_paste {
+                        "external"
+                    } else {
+                        "X"
+                    }),
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_shared_input_revision_only_admission(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let mut editor_cx = EditorTestContext::new(cx).await;
+        let required = NativeInput {
+            clipboard: Some(ClipboardAccess::Write),
+            ..NativeInput::default()
+        };
+        editor_cx.update_editor(|editor, window, cx| {
+            let scope = editor
+                .defer_shared_input(
+                    required,
+                    |_, _, _| panic!("ready writer queued"),
+                    window,
+                    cx,
+                )
+                .expect("metadata admission")
+                .expect("ready writer");
+            scope.run(cx, |cx| {
+                let capture = CapturedInput::current(cx)
+                    .and_then(|input| input.clipboard.as_ref())
+                    .expect("metadata capture");
+                assert_eq!(capture.mode, ClipboardReadMode::RevisionOnly);
+                assert!(capture.check_ready(ClipboardReadMode::Contents).is_err());
+                editor
+                    .write_to_clipboard(ClipboardItem::new_string(String::from("initial")), cx)
+                    .expect("metadata-only writer");
+            });
+        });
+        for mode in [ClipboardReadMode::RevisionOnly, ClipboardReadMode::Contents] {
+            let completion = editor_cx.update_editor(|editor, window, cx| {
+                let native = cx.read_clipboard_snapshot(ClipboardReadMode::RevisionOnly);
+                let channel = cx.global::<ClipboardChannels>().clipboard();
+                let captured = channel.capture(None, mode, |requested| {
+                    if mode == ClipboardReadMode::RevisionOnly {
+                        assert_eq!(
+                            requested,
+                            ClipboardReadMode::RevisionOnly,
+                            "contents reader is forbidden"
+                        );
+                        ClipboardSnapshotRead::ready(native.clone())
+                    } else {
+                        let (read, resolver) = ClipboardSnapshotRead::pending();
+                        resolver.resolve_with_revision(
+                            Err(ClipboardReadError::Unavailable),
+                            native.revision.clone(),
+                        );
+                        read
+                    }
+                });
+                assert!(captured.check_ready(ClipboardReadMode::Contents).is_err());
+                let input = CapturedInput {
+                    clipboard: Some(captured.clone()),
+                    ..CapturedInput::default()
+                };
+                input.clone().run(cx, |cx| {
+                    let scope = editor
+                        .defer_shared_input(
+                            required,
+                            |_, _, _| panic!("ready writer queued"),
+                            window,
+                            cx,
+                        )
+                        .expect("contents failure does not prevent writing")
+                        .expect("ready writer");
+                    scope.run(cx, |cx| {
+                        editor
+                            .write_to_clipboard(
+                                ClipboardItem::new_string(String::from("written")),
+                                cx,
+                            )
+                            .expect("writer admitted");
+                    });
+                });
+                assert_eq!(
+                    cx.read_from_clipboard().and_then(|item| item.text()),
+                    Some(String::from("written"))
+                );
+                cx.write_to_clipboard(ClipboardItem::new_string(String::from("external")));
+                let current = editor.capture_clipboard(ClipboardReadMode::RevisionOnly, cx);
+                let revision = channel.state.borrow().revision.clone();
+                let retained = channel.capture(
+                    Some(&captured),
+                    ClipboardReadMode::RevisionOnly,
+                    |_| -> ClipboardSnapshotRead { panic!("reused capture reread newer source") },
+                );
+                assert_eq!(channel.state.borrow().revision, revision);
+                assert_eq!(
+                    retained
+                        .value()
+                        .expect("retained provenance")
+                        .provenance
+                        .as_ref()
+                        .zip(
+                            current
+                                .value()
+                                .expect("current provenance")
+                                .provenance
+                                .as_ref()
+                        )
+                        .and_then(|(retained, current)| retained.same_epoch(current)),
+                    Some(false)
+                );
+                input.run(cx, |cx| {
+                    editor.schedule_input_continuation(window, cx, |_, _| {});
+                    let editor_handle = cx.weak_entity();
+                    assert!(
+                        editor
+                            .defer_shared_input(
+                                required,
+                                move |result, _, cx| {
+                                    result.expect("queued metadata admission");
+                                    editor_handle
+                                        .update(cx, |editor, cx| {
+                                            editor
+                                                .write_to_clipboard(
+                                                    ClipboardItem::new_string(String::from(
+                                                        "stale",
+                                                    )),
+                                                    cx,
+                                                )
+                                                .expect("superseded writer");
+                                        })
+                                        .expect("editor");
+                                },
+                                window,
+                                cx
+                            )
+                            .expect("queued admission")
+                            .is_none()
+                    );
+                });
+                assert_eq!(channel.state.borrow().revision, revision);
+                editor.input_completion(cx)
+            });
+            completion.await.expect("metadata-only queued writer");
+            editor_cx.update(|_, cx| {
+                assert_eq!(
+                    cx.read_from_clipboard().and_then(|item| item.text()),
+                    Some(String::from("external"))
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_pending_capture_and_cancellation(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let mut hot = EditorTestContext::new(cx).await;
+        hot.set_state("ˇ");
+        let scope = hot.update_editor(|editor, window, cx| {
+            let ordered = editor
+                .defer_shared_input(
+                    NativeInput::default(),
+                    |_, _, _| panic!("hot internal input was queued"),
+                    window,
+                    cx,
+                )
+                .expect("internal input needs no native captures")
+                .expect("ready internal input");
+            ordered.run(cx, |cx| {
+                let input = CapturedInput::current(cx).expect("shared input scope");
+                assert!(input.clipboard.is_none());
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                assert!(input.primary.is_none());
+            });
+            cx.write_to_clipboard(ClipboardItem::new_string(String::from("hot capture")));
+            let scope = editor
+                .defer_shared_input(
+                    NativeInput {
+                        clipboard: Some(ClipboardAccess::Read),
+                        ..NativeInput::default()
+                    },
+                    |_, _, _| panic!("hot shared input was queued"),
+                    window,
+                    cx,
+                )
+                .expect("hot shared input")
+                .expect("ready shared input");
+            assert!(!editor.shared_input_is_deferred());
+            assert_eq!(editor.text(cx), "");
+            scope
+        });
+        let editor_handle = hot.editor.clone();
+        hot.update(|window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(String::from("later")));
+            scope.run(cx, |cx| {
+                editor_handle.update(cx, |editor, cx| editor.paste(&Paste, window, cx));
+            });
+        });
+        hot.assert_editor_state("hot captureˇ");
+        for (cancellation, shared) in [
+            ("none", false),
+            ("none", true),
+            ("window", false),
+            ("producer", false),
+        ] {
+            let mut editor_cx = EditorTestContext::new(cx).await;
+            editor_cx.set_state("ˇ");
+            let (read, resolver) = ClipboardSnapshotRead::pending();
+            let completion = editor_cx.update_editor(|editor, window, cx| {
+                let capture = cx.global::<ClipboardChannels>().clipboard().capture(
+                    None,
+                    ClipboardReadMode::Contents,
+                    |_| read,
+                );
+                CapturedInput {
+                    clipboard: Some(capture),
+                    ..CapturedInput::default()
+                }
+                .run(cx, |cx| {
+                    if shared {
+                        let editor_handle = cx.weak_entity();
+                        assert!(
+                            editor
+                                .defer_shared_input(
+                                    NativeInput {
+                                        clipboard: Some(ClipboardAccess::Read),
+                                        ..NativeInput::default()
+                                    },
+                                    move |result, window, cx| {
+                                        result.expect("queued clipboard admission");
+                                        editor_handle
+                                            .update(cx, |editor, cx| {
+                                                editor.paste(&Paste, window, cx)
+                                            })
+                                            .expect("editor");
+                                    },
+                                    window,
+                                    cx
+                                )
+                                .expect("queued admission")
+                                .is_none()
+                        );
+                    } else {
+                        editor.paste(&Paste, window, cx);
+                    }
+                });
+                assert!(editor.shared_input_is_deferred());
+                editor.input_completion(cx)
+            });
+            cx.run_until_parked();
+            editor_cx.assert_editor_state("ˇ");
+            if cancellation == "window" {
+                editor_cx.update(|window, _| window.remove_window());
+            }
+            if cancellation == "producer" {
+                drop(resolver);
+            } else {
+                resolver.resolve(Ok(Arc::new(clipboard_snapshot(Some("captured")))));
+                if cancellation == "none" {
+                    editor_cx.update(|_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(String::from("later")));
+                    });
+                }
+            }
+            if cancellation == "none" {
+                completion.await.expect("resolved native input");
+                editor_cx.assert_editor_state("capturedˇ");
+            } else {
+                completion.await.expect_err("cancelled native input");
+                editor_cx
+                    .editor
+                    .read_with(cx, |editor, cx| assert_eq!(editor.text(cx), ""));
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_failure_keeps_optional_input_and_owner(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        let mut editor_cx = EditorTestContext::new(cx).await;
+        editor_cx.set_state("ˇ");
+        let (read, resolver) = ClipboardSnapshotRead::pending();
+        let completion = editor_cx.update_editor(|editor, window, cx| {
+            let capture = cx.global::<ClipboardChannels>().clipboard().capture(
+                None,
+                ClipboardReadMode::Contents,
+                |_| read,
+            );
+            CapturedInput {
+                clipboard: Some(capture),
+                ..CapturedInput::default()
+            }
+            .run(cx, |cx| {
+                assert!(
+                    editor
+                        .defer_shared_input(
+                            NativeInput::default(),
+                            |_, _, _| panic!("optional pending capture blocked internal input"),
+                            window,
+                            cx,
+                        )
+                        .expect("optional capture is not required")
+                        .is_some()
+                );
+                let editor_handle = cx.weak_entity();
+                let input = CapturedInput::current(cx).cloned().expect("admitted input");
+                editor.schedule_input_continuation(window, cx, move |window, cx| {
+                    input.run(cx, |cx| {
+                        editor_handle
+                            .update(cx, |editor, cx| {
+                                editor.handle_input("a", window, cx);
+                                editor.paste(&Paste, window, cx);
+                            })
+                            .expect("editor");
+                    });
+                });
+                let editor_handle = cx.weak_entity();
+                assert!(
+                    editor
+                        .defer_shared_input(
+                            NativeInput::default(),
+                            move |result, window, cx| {
+                                result.expect("queued internal admission");
+                                editor_handle
+                                    .update(cx, |editor, cx| {
+                                        editor.handle_input("b", window, cx);
+                                    })
+                                    .expect("queued internal input");
+                            },
+                            window,
+                            cx,
+                        )
+                        .expect("queued admission")
+                        .is_none()
+                );
+            });
+            editor.input_completion(cx)
+        });
+        cx.run_until_parked();
+        editor_cx.assert_editor_state("aˇ");
+        resolver.resolve(Err(ClipboardReadError::Unavailable));
+        completion.await.expect_err("native prerequisite failed");
+        editor_cx.assert_editor_state("abˇ");
+        let completion = editor_cx.update_editor(|editor, window, cx| {
+            let capture = cx.global::<ClipboardChannels>().clipboard().capture(
+                None,
+                ClipboardReadMode::Contents,
+                |_| ClipboardSnapshotRead::failed(ClipboardReadError::Unavailable),
+            );
+            CapturedInput {
+                clipboard: Some(capture),
+                ..CapturedInput::default()
+            }
+            .run(cx, |cx| {
+                let scope = editor
+                    .defer_shared_input(
+                        NativeInput::default(),
+                        |_, _, _| panic!("optional failed capture blocked internal input"),
+                        window,
+                        cx,
+                    )
+                    .expect("failed optional capture is not required")
+                    .expect("ready internal input");
+                scope.run(cx, |cx| editor.handle_input("c", window, cx));
+            });
+            let editor_handle = cx.weak_entity();
+            editor.schedule_input_continuation(window, cx, move |window, cx| {
+                editor_handle
+                    .update(cx, |editor, cx| editor.handle_input("d", window, cx))
+                    .expect("surviving editor");
+            });
+            editor.input_completion(cx)
+        });
+        completion.await.expect("owner remains usable");
+        editor_cx.assert_editor_state("abcdˇ");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[gpui::test]
+    async fn test_shared_input_requires_only_requested_native_channel(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let mut editor_cx = EditorTestContext::new(cx).await;
+        for primary in [false, true] {
+            for failed in [false, true] {
+                let (read, resolver) = ClipboardSnapshotRead::pending();
+                let resolver = if failed {
+                    resolver.resolve(Err(ClipboardReadError::Unavailable));
+                    None
+                } else {
+                    Some(resolver)
+                };
+                let completion = editor_cx.update_editor(|editor, window, cx| {
+                    let channels = cx.global::<ClipboardChannels>();
+                    let ready =
+                        |_| ClipboardSnapshotRead::ready(clipboard_snapshot(Some("required")));
+                    let input = if primary {
+                        CapturedInput {
+                            clipboard: Some(channels.clipboard().capture(
+                                None,
+                                ClipboardReadMode::Contents,
+                                |_| read,
+                            )),
+                            primary: Some(channels.primary().capture(
+                                None,
+                                ClipboardReadMode::Contents,
+                                ready,
+                            )),
+                            ..CapturedInput::default()
+                        }
+                    } else {
+                        CapturedInput {
+                            clipboard: Some(channels.clipboard().capture(
+                                None,
+                                ClipboardReadMode::Contents,
+                                ready,
+                            )),
+                            primary: Some(channels.primary().capture(
+                                None,
+                                ClipboardReadMode::Contents,
+                                |_| read,
+                            )),
+                            ..CapturedInput::default()
+                        }
+                    };
+                    input.run(cx, |cx| {
+                        let required = NativeInput {
+                            clipboard: (!primary).then_some(ClipboardAccess::Read),
+                            primary: primary.then_some(ClipboardAccess::Read),
+                        };
+                        let scope = editor
+                            .defer_shared_input(
+                                required,
+                                |_, _, _| panic!("unrelated native channel blocked input"),
+                                window,
+                                cx,
+                            )
+                            .expect("requested native channel is ready")
+                            .expect("ready requested input");
+                        scope.run(cx, |cx| {
+                            let item = if primary {
+                                editor.read_from_primary(cx)
+                            } else {
+                                editor.read_from_clipboard(cx)
+                            };
+                            assert_eq!(
+                                item.expect("requested clipboard")
+                                    .and_then(|item| item.text()),
+                                Some(String::from("required"))
+                            );
+                        });
+                        assert!(!editor.shared_input_is_deferred());
+                        editor.schedule_input_continuation(window, cx, |_, _| {});
+                        let editor_handle = cx.weak_entity();
+                        assert!(
+                            editor
+                                .defer_shared_input(
+                                    required,
+                                    move |result, _, cx| {
+                                        result.expect("queued requested admission");
+                                        editor_handle
+                                            .update(cx, |editor, cx| {
+                                                let item = if primary {
+                                                    editor.read_from_primary(cx)
+                                                } else {
+                                                    editor.read_from_clipboard(cx)
+                                                };
+                                                assert_eq!(
+                                                    item.expect("queued requested clipboard")
+                                                        .and_then(|item| item.text()),
+                                                    Some(String::from("required"))
+                                                );
+                                            })
+                                            .expect("editor");
+                                    },
+                                    window,
+                                    cx,
+                                )
+                                .expect("queued admission")
+                                .is_none()
+                        );
+                    });
+                    editor.input_completion(cx)
+                });
+                completion
+                    .await
+                    .expect("unrelated native channel is not a prerequisite");
+                drop(resolver);
+            }
+        }
+    }
+
+    #[test]
+    fn test_deferred_clipboard_channels_have_independent_writes() {
+        let clipboard = DeferredClipboard::default();
+        let primary = DeferredClipboard::default();
+        let native_clipboard = RefCell::new(clipboard_snapshot(None));
+        let native_primary = RefCell::new(clipboard_snapshot(Some("primary")));
+        let captured_clipboard = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+            native_clipboard.borrow().clone()
+        });
+        let captured_primary = primary.capture(None, ClipboardReadMode::Contents, |_| {
+            native_primary.borrow().clone()
+        });
+        clipboard
+            .write(
+                Some(&captured_clipboard),
+                ClipboardItem::new_string(String::from("copy")),
+                || native_clipboard.borrow().revision.clone(),
+                |item| publish_clipboard(&native_clipboard, item),
+            )
+            .expect("clipboard publication");
+        let consumed = primary
+            .read(Some(&captured_primary), || None)
+            .expect("captured primary read");
+        primary
+            .write(
+                Some(&captured_primary),
+                ClipboardItem::new_string(String::from("selection")),
+                || native_primary.borrow().revision.clone(),
+                |item| publish_clipboard(&native_primary, item),
+            )
+            .expect("primary publication");
+        assert_eq!(
+            consumed.and_then(|item| item.text()).as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            clipboard
+                .read(Some(&captured_clipboard), || None)
+                .expect("captured clipboard read")
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("copy")
+        );
+        assert_eq!(
+            primary
+                .read(Some(&captured_primary), || None)
+                .expect("captured primary read")
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("selection")
+        );
+        let retried = primary.capture(
+            Some(&captured_primary),
+            ClipboardReadMode::Contents,
+            |_| -> ClipboardSnapshot { panic!("retry reread primary") },
+        );
+        assert!(Arc::ptr_eq(
+            &retried
+                .value()
+                .expect("resolved retry")
+                .snapshot
+                .expect("retried contents"),
+            &captured_primary
+                .value()
+                .expect("resolved capture")
+                .snapshot
+                .expect("captured contents")
+        ));
+        let failed_primary =
+            primary.capture(None, ClipboardReadMode::Contents, |_| ClipboardSnapshot {
+                item: native_primary.borrow().item.clone(),
+                revision: None,
+            });
+        primary
+            .write(
+                Some(&failed_primary),
+                ClipboardItem::new_string(String::from("unpublished")),
+                || None,
+                |_| panic!("ambiguous primary publication"),
+            )
+            .expect_err("primary ordering is unavailable");
+        assert_eq!(
+            clipboard
+                .read(Some(&captured_clipboard), || panic!("clipboard reread"))
+                .expect("primary failure leaves clipboard independent")
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("copy"),
+        );
+        assert_eq!(
+            primary
+                .read(Some(&captured_clipboard), || None)
+                .expect("other channel read"),
+            None
+        );
+        assert_eq!(
+            DeferredClipboard::default()
+                .read(Some(&retried), || None)
+                .expect("new state read"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_deferred_clipboard_partial_drain() {
+        let clipboard = DeferredClipboard::default();
+        let native = RefCell::new(clipboard_snapshot(Some("Z")));
+        let first = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+            native.borrow().clone()
+        });
+        let second = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+            native.borrow().clone()
+        });
+        clipboard
+            .write(
+                Some(&first),
+                ClipboardItem::new_string(String::from("A")),
+                || native.borrow().revision.clone(),
+                |item| publish_clipboard(&native, item),
+            )
+            .expect("first publication");
+        let paste = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+            native.borrow().clone()
+        });
+        clipboard
+            .write(
+                Some(&second),
+                ClipboardItem::new_string(String::from("C")),
+                || native.borrow().revision.clone(),
+                |item| publish_clipboard(&native, item),
+            )
+            .expect("second publication");
+        assert_eq!(
+            clipboard
+                .read(Some(&paste), || None)
+                .expect("partial drain read")
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("C")
+        );
+        *native.borrow_mut() = clipboard_snapshot(Some("B"));
+        clipboard
+            .write(
+                Some(&second),
+                ClipboardItem::new_string(String::from("stale")),
+                || native.borrow().revision.clone(),
+                |_| panic!("stale native publication"),
+            )
+            .expect("superseded publication");
+        let paste = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+            native.borrow().clone()
+        });
+        assert_eq!(
+            clipboard
+                .read(Some(&paste), || None)
+                .expect("external snapshot read")
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("B")
+        );
+        clipboard
+            .write(
+                Some(&second),
+                ClipboardItem::new_string(String::from("stale")),
+                || None,
+                |_| panic!("lost a known external observation"),
+            )
+            .expect("superseded publication without a current observation");
+    }
+
+    #[test]
+    fn test_deferred_clipboard_unavailable_identity() {
+        for text in [None, Some("B")] {
+            let clipboard = DeferredClipboard::default();
+            let native = RefCell::new(ClipboardSnapshot {
+                item: text.map(|text| ClipboardItem::new_string(text.to_owned())),
+                revision: None,
+            });
+            let copy = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+                native.borrow().clone()
+            });
+            let paste = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+                native.borrow().clone()
+            });
+            native.borrow_mut().item = Some(ClipboardItem::new_string(String::from("late")));
+            assert_eq!(
+                clipboard
+                    .read(Some(&paste), || panic!("captured clipboard reread"))
+                    .expect("unconflicted snapshot")
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                text,
+            );
+            assert_eq!(
+                clipboard
+                    .write(
+                        Some(&copy),
+                        ClipboardItem::new_string(String::from("A")),
+                        || None,
+                        |_| panic!("ambiguous native publication"),
+                    )
+                    .expect_err("ambiguous publication must fail")
+                    .to_string(),
+                "Clipboard ordering is unavailable; copy was cancelled",
+            );
+            assert_eq!(
+                clipboard
+                    .read(Some(&paste), || panic!("failed dependency reread"))
+                    .expect_err("ambiguous dependency must fail")
+                    .to_string(),
+                "Clipboard ordering is unavailable; paste was cancelled",
+            );
+            let fresh = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+                native.borrow().clone()
+            });
+            assert_eq!(
+                clipboard
+                    .read(Some(&fresh), || panic!("fresh snapshot reread"))
+                    .expect("snapshot after the failed operation")
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some("late"),
+            );
+            clipboard
+                .write(
+                    None,
+                    ClipboardItem::new_string(String::from("direct")),
+                    || None,
+                    |item| {
+                        native.borrow_mut().item = Some(item);
+                        Ok(None)
+                    },
+                )
+                .expect("direct unversioned publication");
+            assert_eq!(
+                native
+                    .borrow()
+                    .item
+                    .as_ref()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some("direct")
+            );
+        }
+    }
+
+    #[test]
+    fn test_deferred_clipboard_publication_loses_continuity() {
+        for fails in [false, true] {
+            let clipboard = DeferredClipboard::default();
+            let native = RefCell::new(clipboard_snapshot(Some("Z")));
+            let first = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+                native.borrow().clone()
+            });
+            let second = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+                native.borrow().clone()
+            });
+            let early_paste = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+                native.borrow().clone()
+            });
+            let result = clipboard.write(
+                Some(&first),
+                ClipboardItem::new_string(String::from("A")),
+                || native.borrow().revision.clone(),
+                |item| {
+                    publish_clipboard(&native, item)?;
+                    if fails {
+                        anyhow::bail!("injected publication failure");
+                    }
+                    Ok(None)
+                },
+            );
+            let early_read = clipboard.read(Some(&early_paste), || panic!("early paste reread"));
+            if fails {
+                assert_eq!(
+                    result.expect_err("publication failed").to_string(),
+                    "injected publication failure"
+                );
+                assert_eq!(
+                    early_read
+                        .expect_err("failed publication dependency")
+                        .to_string(),
+                    "injected publication failure"
+                );
+            } else {
+                result.expect("unversioned publication succeeded");
+                assert_eq!(
+                    early_read
+                        .expect("logical write before receipt loss")
+                        .and_then(|item| item.text())
+                        .as_deref(),
+                    Some("A")
+                );
+            }
+            let paste = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+                native.borrow().clone()
+            });
+            assert_eq!(
+                clipboard
+                    .write(
+                        Some(&second),
+                        ClipboardItem::new_string(String::from("C")),
+                        || native.borrow().revision.clone(),
+                        |_| panic!("publication across an uncertain segment"),
+                    )
+                    .expect_err("uncertain publication must fail")
+                    .to_string(),
+                "Clipboard ordering is unavailable; copy was cancelled"
+            );
+            assert_eq!(
+                clipboard
+                    .read(Some(&paste), || panic!("partial drain reread"))
+                    .expect_err("partial drain lost continuity")
+                    .to_string(),
+                "Clipboard ordering is unavailable; paste was cancelled"
+            );
+            let fresh = clipboard.capture(None, ClipboardReadMode::Contents, |_| {
+                native.borrow().clone()
+            });
+            clipboard
+                .write(
+                    Some(&fresh),
+                    ClipboardItem::new_string(String::from("D")),
+                    || native.borrow().revision.clone(),
+                    |item| publish_clipboard(&native, item),
+                )
+                .expect("publication in the new segment");
+            assert_eq!(
+                clipboard
+                    .read(Some(&fresh), || panic!("new segment reread"))
+                    .expect("new segment dependency")
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some("D")
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_keystroke_factory_is_lazy(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.update_editor(|editor, window, cx| {
+            assert!(!editor.defer_keystroke_input(
+                |_, _| panic!("ready input constructed a keystroke replay"),
+                window,
+                cx,
+            ));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_fallback_captures_payload(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        for already_pending in [false, true] {
+            let mut cx = EditorTestContext::new(cx).await;
+            cx.update(|window, cx| {
+                cx.bind_keys([
+                    KeyBinding::new("ctrl-v", Paste, Some("Editor")),
+                    KeyBinding::new("ctrl-v", MoveUp, Some("Editor")),
+                ]);
+                window.draw(cx).clear(cx);
+            });
+            cx.background_executor.set_block_on_ticks(0..=0);
+            let editor = cx.editor.clone();
+            let text = "x".repeat(2_000);
+            let completion = cx.update(|window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.set_soft_wrap_mode(SoftWrap::None, cx);
+                    editor.set_text(text.clone(), window, cx);
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            selections.select_ranges([Point::zero()..Point::zero()]);
+                        },
+                    );
+                    assert!(!editor.input_is_deferred(cx));
+                    if already_pending {
+                        editor.move_up(&MoveUp, window, cx);
+                        assert!(editor.input_is_deferred(cx));
+                    }
+                });
+                cx.write_to_clipboard(ClipboardItem::new_string(String::from("A")));
+                window.dispatch_keystroke(Keystroke::parse("ctrl-v").expect("fallback key"), cx);
+                cx.write_to_clipboard(ClipboardItem::new_string(String::from("B")));
+                editor.update(cx, |editor, cx| {
+                    assert!(editor.input_is_deferred(cx));
+                    assert_eq!(editor.text(cx), text);
+                    editor.input_completion(cx)
+                })
+            });
+            cx.background_executor.set_block_on_ticks(0..=50);
+            completion.await.expect("clipboard fallback completed");
+            cx.assert_editor_state(&format!("Aˇ{text}"));
+        }
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_captures_each_paste(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        for ingress in [
+            PasteIngress::Direct,
+            PasteIngress::Action,
+            PasteIngress::RegisteredAction,
+            PasteIngress::RegisteredKeyboard,
+        ] {
+            let (mut cx, _subscription) = clipboard_test_context(ingress, cx).await;
+            let editor = cx.editor.clone();
+            let completion = cx.update(|window, cx| {
+                start_deferred_clipboard_input(&editor, window, cx);
+                for text in ["A", "B"] {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+                    dispatch_paste(ingress, &editor, window, cx);
+                }
+                cx.write_to_clipboard(ClipboardItem::new_string(String::from("C")));
+                editor.update(cx, |editor, cx| editor.input_completion(cx))
+            });
+            completion.await.expect("clipboard input completed");
+            cx.assert_editor_state(&format!("ab\nxABˇ{}\ncd", "x".repeat(1_999)));
+        }
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_replayed_writes_are_dependencies(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        for ingress in [
+            PasteIngress::Direct,
+            PasteIngress::Action,
+            PasteIngress::RegisteredAction,
+            PasteIngress::RegisteredKeyboard,
+        ] {
+            for (external, after_paste, expected) in [
+                (&[][..], false, "A"),
+                (&["B"][..], false, "B"),
+                (&["Z"][..], false, "Z"),
+                (&["Y", "Z"][..], false, "Z"),
+                (&[][..], true, "A"),
+            ] {
+                for cold in [false, true] {
+                    let (mut cx, _subscription) = clipboard_test_context(ingress, cx).await;
+                    let editor = cx.editor.clone();
+                    let line = "x".repeat(2_000);
+                    let completion = cx.update_editor(|editor, window, cx| {
+                        editor.set_soft_wrap_mode(SoftWrap::None, cx);
+                        editor.set_text(format!("A\n{line}"), window, cx);
+                        editor.change_selections(
+                            SelectionEffects::no_scroll(),
+                            window,
+                            cx,
+                            |selections| {
+                                selections.select_ranges([Point::new(0, 0)..Point::new(0, 0)]);
+                            },
+                        );
+                        editor.move_down(&MoveDown, window, cx);
+                        assert!(editor.input_is_deferred(cx));
+                        editor.input_completion(cx)
+                    });
+                    if !cold {
+                        completion.await.expect("warm clipboard geometry");
+                    }
+                    let completion = cx.update(|window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(String::from("Z")));
+                        editor.update(cx, |editor, cx| {
+                            let select =
+                                |editor: &mut Editor,
+                                 window: &mut Window,
+                                 cx: &mut Context<Editor>| {
+                                    editor.change_selections(
+                                        SelectionEffects::no_scroll(),
+                                        window,
+                                        cx,
+                                        |selections| {
+                                            selections.select_ranges([
+                                                Point::new(0, 0)..Point::new(0, 1)
+                                            ]);
+                                        },
+                                    );
+                                };
+                            if !editor.defer_input(select, window, cx) {
+                                select(editor, window, cx);
+                            }
+                            editor.copy(&Copy, window, cx);
+                        });
+                        for text in external {
+                            cx.write_to_clipboard(ClipboardItem::new_string((*text).to_owned()));
+                        }
+                        dispatch_paste(ingress, &editor, window, cx);
+                        if after_paste {
+                            cx.write_to_clipboard(ClipboardItem::new_string(String::from("late")));
+                        }
+                        editor.update(cx, |editor, cx| editor.input_completion(cx))
+                    });
+                    completion.await.expect("clipboard provenance completed");
+                    cx.assert_editor_state(&format!("{expected}ˇ\n{line}"));
+                    cx.update(|_, cx| {
+                        assert_eq!(
+                            cx.read_from_clipboard()
+                                .and_then(|item| item.text())
+                                .as_deref(),
+                            Some(if after_paste { "late" } else { expected })
+                        );
+                    });
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_captures_empty_clipboard(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let (mut cx, _subscription) =
+            clipboard_test_context(PasteIngress::RegisteredKeyboard, cx).await;
+        let editor = cx.editor.clone();
+        let completion = cx.update(|window, cx| {
+            start_deferred_clipboard_input(&editor, window, cx);
+            assert_eq!(cx.read_from_clipboard(), None);
+            dispatch_paste(PasteIngress::RegisteredKeyboard, &editor, window, cx);
+            cx.write_to_clipboard(ClipboardItem::new_string(String::from("late")));
+            editor.update(cx, |editor, cx| editor.input_completion(cx))
+        });
+        completion.await.expect("empty clipboard input completed");
+        cx.assert_editor_state(&format!("ab\nxˇ{}\ncd", "x".repeat(1_999)));
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_capture_after_replayed_write(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let (mut cx, _subscription) = clipboard_test_context(PasteIngress::Direct, cx).await;
+        let editor = cx.editor.clone();
+        let completion = cx.update(|window, cx| {
+            start_deferred_clipboard_input(&editor, window, cx);
+            editor.update(cx, |editor, cx| {
+                editor.cut(&Cut, window, cx);
+                assert!(editor.defer_input(
+                    |editor, window, cx| {
+                        editor.buffer.update(cx, |buffer, cx| {
+                            let end = buffer.len(cx);
+                            buffer.edit([(end..end, format!("\n{}", "y".repeat(2_000)))], None, cx);
+                        });
+                        editor.move_down(&MoveDown, window, cx);
+                        assert!(editor.input_is_deferred(cx));
+                        cx.write_to_clipboard(ClipboardItem::new_string(String::from("A")));
+                        editor.paste(&Paste, window, cx);
+                        cx.write_to_clipboard(ClipboardItem::new_string(String::from("B")));
+                    },
+                    window,
+                    cx,
+                ));
+                editor.input_completion(cx)
+            })
+        });
+        completion.await.expect("nested clipboard input completed");
+        cx.assert_editor_state(&format!("ab\ncd\nAˇ{}", "y".repeat(2_000)));
+    }
+
+    #[gpui::test]
+    async fn test_async_clipboard_publication_orders_input_and_cancellation(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        for operation in ["copy", "cut", "cut_to_end"] {
+            let cut = operation != "copy";
+            for outcome in ["success", "failure", "cancel"] {
+                let mut editor_cx = EditorTestContext::new(cx).await;
+                editor_cx.set_state("«abcˇ»");
+                let editor = editor_cx.editor.clone();
+                let (sender, receiver) = oneshot::channel();
+                let mut completion = editor_cx.update_editor(|editor, window, cx| {
+                    let task = cx.background_spawn(async move {
+                        receiver.await.expect("publication resolved")
+                    });
+                    cx.set_global(TestClipboardPublication(Box::new({
+                        let task = RefCell::new(Some(task));
+                        move |_| task.borrow_mut().take().expect("one publication")
+                    })));
+                    match operation {
+                        "copy" => editor.copy(&Copy, window, cx),
+                        "cut" => editor.cut(&Cut, window, cx),
+                        _ => editor.cut_to_end_of_line(
+                            &CutToEndOfLine {
+                                stop_at_newlines: false,
+                            },
+                            window,
+                            cx,
+                        ),
+                    }
+                    assert_eq!(editor.text(cx), "abc");
+                    assert_eq!(editor.input_is_deferred(cx), cut);
+                    editor.move_to_end_of_line(&MoveToEndOfLine::default(), window, cx);
+                    editor.handle_input("!", window, cx);
+                    assert_eq!(editor.text(cx), if cut { "abc" } else { "abc!" });
+                    editor.input_completion(cx)
+                });
+                editor_cx.run_until_parked();
+                assert!((&mut completion).now_or_never().is_none());
+                if outcome == "cancel" {
+                    editor_cx.update(|window, _| window.remove_window());
+                    editor_cx.run_until_parked();
+                    assert!(sender.is_canceled());
+                } else {
+                    sender
+                        .send(if outcome == "success" {
+                            Ok(None)
+                        } else {
+                            Err(anyhow!("publication rejected"))
+                        })
+                        .expect("publication still pending");
+                }
+                let result = completion.await;
+                if outcome == "success" {
+                    result.expect("publication completed");
+                } else {
+                    assert!(result.is_err());
+                }
+                assert_eq!(
+                    editor.read_with(cx, |editor, cx| editor.text(cx)),
+                    match (cut, outcome) {
+                        (true, "success") => "!",
+                        (true, "cancel") => "abc",
+                        _ => "abc!",
+                    }
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_async_clipboard_repeated_commands_preserve_fifo(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        for (first_cut, second_cut, successful_text) in [
+            (false, false, "abc\ndef"),
+            (false, true, "\ndef"),
+            (true, false, "\ndef"),
+            (true, true, "def"),
+        ] {
+            for outcome in ["success", "first_failure", "second_failure", "cancel"] {
+                let mut editor_cx = EditorTestContext::new(cx).await;
+                editor_cx.set_state("«abcˇ»\ndef");
+                let editor = editor_cx.editor.clone();
+                let publications = Rc::new(RefCell::new(Vec::new()));
+                let (first_sender, first_receiver) = oneshot::channel();
+                let (second_sender, second_receiver) = oneshot::channel();
+                let (mut completion, mut checkpoint) =
+                    editor_cx.update(|window, cx| {
+                        cx.set_global(crate::test::NativeClipboardCapture(Rc::new(|_, _| {
+                            ClipboardSnapshotRead::ready(ClipboardSnapshot::default())
+                        })));
+                        let tasks = RefCell::new(
+                            [first_receiver, second_receiver]
+                                .map(|receiver| {
+                                    cx.background_spawn(async move {
+                                        receiver.await.expect("publication resolved")
+                                    })
+                                })
+                                .into_iter()
+                                .collect::<VecDeque<_>>(),
+                        );
+                        cx.set_global(TestClipboardPublication(Box::new({
+                            let publications = publications.clone();
+                            move |item| {
+                                publications
+                                    .borrow_mut()
+                                    .push(item.text().expect("text publication"));
+                                tasks.borrow_mut().pop_front().expect("two publications")
+                            }
+                        })));
+                        cx.bind_keys([
+                            KeyBinding::new("ctrl-c", Copy, Some("Editor")),
+                            KeyBinding::new("ctrl-x", Cut, Some("Editor")),
+                        ]);
+                        window.draw(cx).clear(cx);
+                        for cut in [first_cut, second_cut] {
+                            let key = if cut { "ctrl-x" } else { "ctrl-c" };
+                            assert!(window.dispatch_keystroke(
+                                Keystroke::parse(key).expect("clipboard key"),
+                                cx,
+                            ));
+                        }
+                        editor.update(cx, |editor, cx| {
+                            (
+                                editor.input_completion(cx),
+                                editor.pending_document_input(cx),
+                            )
+                        })
+                    });
+                editor_cx.run_until_parked();
+                assert_eq!(*publications.borrow(), ["abc"]);
+                assert_eq!(editor_cx.buffer_text(), "abc\ndef");
+                first_sender
+                    .send(if outcome == "first_failure" {
+                        Err(anyhow!("first publication rejected"))
+                    } else {
+                        Ok(None)
+                    })
+                    .expect("first publication pending");
+                editor_cx.run_until_parked();
+                let first_deleted = first_cut && outcome != "first_failure";
+                let after_first = if first_deleted { "\ndef" } else { "abc\ndef" };
+                assert_eq!(
+                    *publications.borrow(),
+                    ["abc", if first_deleted { "\n" } else { "abc" }],
+                );
+                assert_eq!(editor_cx.buffer_text(), after_first);
+                assert!((&mut completion).now_or_never().is_none());
+                assert!((&mut checkpoint).now_or_never().is_none());
+                if outcome == "cancel" {
+                    editor_cx.update(|window, _| window.remove_window());
+                    editor_cx.run_until_parked();
+                    assert!(second_sender.is_canceled());
+                } else {
+                    second_sender
+                        .send(if outcome == "second_failure" {
+                            Err(anyhow!("second publication rejected"))
+                        } else {
+                            Ok(None)
+                        })
+                        .expect("second publication pending");
+                }
+                for result in [completion.await, checkpoint.await] {
+                    if outcome == "success" {
+                        result.expect("both publications completed");
+                    } else {
+                        assert_eq!(
+                            result
+                                .expect_err("publication failed or cancelled")
+                                .to_string(),
+                            match outcome {
+                                "first_failure" =>
+                                    "Clipboard operation failed: first publication rejected",
+                                "second_failure" =>
+                                    "Clipboard operation failed: second publication rejected",
+                                _ => "editor window closed before deferred input completed",
+                            },
+                        );
+                    }
+                }
+                assert_eq!(
+                    editor.read_with(cx, |editor, cx| editor.text(cx)),
+                    match outcome {
+                        "success" => successful_text,
+                        "first_failure" if second_cut => "\ndef",
+                        "first_failure" => "abc\ndef",
+                        _ => after_first,
+                    },
+                    "first_cut={first_cut}, second_cut={second_cut}, outcome={outcome}",
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_failed_cut_preserves_text(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        for (cold, unavailable_provenance) in [(false, false), (true, false), (true, true)] {
+            for to_end_of_line in [false, true] {
+                let (mut cx, _subscription) =
+                    clipboard_test_context(PasteIngress::Direct, cx).await;
+                let editor = cx.editor.clone();
+                let completion = cx.update(|window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(String::from("Z")));
+                    if cold {
+                        start_deferred_clipboard_input(&editor, window, cx);
+                    } else {
+                        editor.update(cx, |editor, cx| {
+                            editor.set_text(String::from("ab"), window, cx);
+                            editor.change_selections(
+                                SelectionEffects::no_scroll(),
+                                window,
+                                cx,
+                                |selections| {
+                                    selections.select_ranges([Point::new(0, 1)..Point::new(0, 1)]);
+                                },
+                            );
+                        });
+                    }
+                    editor.update(cx, |editor, cx| {
+                        let captured = editor.capture_clipboard(ClipboardReadMode::Contents, cx);
+                        if unavailable_provenance {
+                            captured
+                                .value
+                                .borrow_mut()
+                                .as_mut()
+                                .expect("resolved capture")
+                                .as_mut()
+                                .expect("successful capture")
+                                .provenance = None;
+                        } else {
+                            cx.fail_next_checked_clipboard_write();
+                        }
+                        CapturedInput {
+                            clipboard: Some(captured),
+                            ..CapturedInput::default()
+                        }
+                        .run(cx, |cx| {
+                            if to_end_of_line {
+                                editor.cut_to_end_of_line(
+                                    &CutToEndOfLine {
+                                        stop_at_newlines: false,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                editor.cut(&Cut, window, cx);
+                            }
+                            if cold {
+                                editor.paste(&Paste, window, cx);
+                            }
+                        });
+                        editor.input_completion(cx)
+                    })
+                });
+                if cold {
+                    assert_eq!(
+                        completion
+                            .await
+                            .expect_err("paste depends on the failed cut")
+                            .to_string(),
+                        if unavailable_provenance {
+                            "Clipboard operation failed: Clipboard ordering is unavailable; copy was cancelled"
+                        } else {
+                            "Clipboard operation failed: Injected clipboard publication failure"
+                        },
+                    );
+                    cx.assert_editor_state(&format!("ab\nxˇ{}\ncd", "x".repeat(1_999)));
+                } else {
+                    completion.await.expect("synchronous cut handled its error");
+                    cx.assert_editor_state("aˇb");
+                }
+                cx.update(|_, cx| {
+                    assert_eq!(
+                        cx.read_from_clipboard()
+                            .and_then(|item| item.text())
+                            .as_deref(),
+                        Some("Z"),
+                    );
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_cut_to_end_of_line_preserves_pending_selection_on_failure(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        for (add, line_mode) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut cx = EditorTestContext::new(cx).await;
+            cx.set_state("ˇabc\ndef");
+            cx.update_editor(|editor, window, cx| {
+                editor.begin_selection(DisplayPoint::new(DisplayRow(1), 2), add, 1, window, cx);
+                editor.update_selection(
+                    DisplayPoint::new(DisplayRow(1), 1),
+                    1,
+                    gpui::Point::default(),
+                    window,
+                    cx,
+                );
+                editor.selections.set_line_mode(line_mode);
+                let pending = editor.selections.pending_anchor().copied();
+                let disjoint = editor.selections.disjoint_anchors_arc();
+                assert!(pending.is_some());
+                cx.write_to_clipboard(ClipboardItem::new_string(String::from("Z")));
+                cx.fail_next_checked_clipboard_write();
+
+                editor.cut_to_end_of_line(&CutToEndOfLine::default(), window, cx);
+
+                assert_eq!(editor.text(cx), "abc\ndef");
+                assert_eq!(editor.selections.pending_anchor().copied(), pending);
+                assert_eq!(editor.selections.disjoint_anchors_arc(), disjoint);
+                assert_eq!(
+                    cx.read_from_clipboard().and_then(|item| item.text()),
+                    Some(String::from("Z"))
+                );
+
+                editor.cut_to_end_of_line(&CutToEndOfLine::default(), window, cx);
+
+                let (remaining_text, clipboard_text) = match (add, line_mode) {
+                    (false, false) => ("abc\nd", "ef"),
+                    (true, false) => ("\nd", "abc\nef"),
+                    (false, true) => ("abc\n", "def"),
+                    (true, true) => ("", "abc\ndef"),
+                };
+                assert_eq!(editor.text(cx), remaining_text);
+                assert_eq!(editor.selections.pending_anchor(), None);
+                assert_eq!(
+                    cx.read_from_clipboard().and_then(|item| item.text()),
+                    Some(String::from(clipboard_text))
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_cross_editor_clipboard_publication_order(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let mut results = Vec::new();
+        for cold in [None, Some(false), Some(true)] {
+            let mut source = EditorTestContext::new(cx).await;
+            let mut target = EditorTestContext::new(cx).await;
+            source.set_state("«alphaˇ»");
+            target.set_state("Bˇ");
+            let source_completion = source.update_editor(|editor, window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(String::from("Z")));
+                if let Some(first_cold) = cold {
+                    editor.set_placeholder_text(&"x".repeat(2_000), window, cx);
+                    let pending = editor
+                        .placeholder_display_map
+                        .as_ref()
+                        .expect("placeholder display map")
+                        .update(cx, |map, cx| {
+                            map.snapshot(cx)
+                                .long_row(DisplayRow(0))
+                                .err()
+                                .expect("cold geometry")
+                        });
+                    editor.defer_geometry(
+                        pending,
+                        move |editor, window, cx| {
+                            if first_cold {
+                                editor.copy(&Copy, window, cx);
+                            }
+                        },
+                        window,
+                        cx,
+                    );
+                    if !first_cold {
+                        editor.copy(&Copy, window, cx);
+                    }
+                } else {
+                    editor.copy(&Copy, window, cx);
+                }
+                editor.input_completion(cx)
+            });
+            let target_completion = target.update_editor(|editor, window, cx| {
+                editor.paste(&Paste, window, cx);
+                editor.handle_input("!", window, cx);
+                editor.input_completion(cx)
+            });
+            source_completion.await.expect("source input completed");
+            target_completion.await.expect("target input completed");
+            results.push(target.editor(|editor, _, cx| editor.text(cx)));
+        }
+        assert_eq!(results, ["Balpha!", "Balpha!", "Balpha!"]);
+    }
+
+    #[gpui::test]
+    async fn test_persistence_waits_for_pending_clipboard_input(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        for operation in [
+            PersistenceOperation::Save,
+            PersistenceOperation::SaveAs,
+            PersistenceOperation::Reload,
+        ] {
+            for failed in [false, true] {
+                for shared in [false, true] {
+                    let fs = FakeFs::new(cx.executor());
+                    fs.insert_tree(path!("/root"), serde_json::json!({ "file": "abc" }))
+                        .await;
+                    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+                    let buffer = project
+                        .update(cx, |project, cx| {
+                            project.open_local_buffer(path!("/root/file"), cx)
+                        })
+                        .await
+                        .expect("saved buffer");
+                    let mut copy_path = buffer.read_with(cx, |buffer, cx| {
+                        buffer.project_path(cx).expect("saved project path")
+                    });
+                    copy_path.path = rel_path("copy").into();
+                    let editor = cx.add_window(|window, cx| {
+                        Editor::for_buffer(buffer, Some(project.clone()), window, cx)
+                    });
+                    let mut editor_cx = EditorTestContext::for_editor(editor, cx).await;
+                    editor_cx.set_selections_state("abcˇ");
+                    assert!(!editor_cx.editor(|editor, _, cx| Item::is_dirty(editor, cx)));
+                    let target = if shared {
+                        editor_cx.update_editor(|editor, window, cx| {
+                            cx.new(|cx| editor.clone(window, cx))
+                        })
+                    } else {
+                        editor_cx.editor.clone()
+                    };
+                    let (resolver, completion) = queue_pending_clipboard_input(&mut editor_cx);
+                    let mut persistence =
+                        target.update_in(&mut editor_cx.cx, |editor, window, cx| match operation {
+                            PersistenceOperation::Save => Item::save(
+                                editor,
+                                SaveOptions {
+                                    format: false,
+                                    force_format: false,
+                                    autosave: false,
+                                },
+                                project.clone(),
+                                window,
+                                cx,
+                            ),
+                            PersistenceOperation::SaveAs => {
+                                Item::save_as(editor, project.clone(), copy_path, window, cx)
+                            }
+                            PersistenceOperation::Reload => {
+                                Item::reload(editor, project.clone(), window, cx)
+                            }
+                        });
+                    cx.run_until_parked();
+                    assert!(
+                        (&mut persistence).now_or_never().is_none(),
+                        "{operation:?}, failed={failed}, shared={shared} completed before input"
+                    );
+                    editor_cx.assert_editor_state("abcˇ");
+                    resolver.resolve(if failed {
+                        Err(ClipboardReadError::Unavailable)
+                    } else {
+                        Ok(Arc::new(clipboard_snapshot(Some("P"))))
+                    });
+                    assert_eq!(completion.await.is_err(), failed);
+                    assert_eq!(
+                        persistence.await.is_err(),
+                        failed,
+                        "{operation:?}, failed={failed}, shared={shared}"
+                    );
+                    assert_eq!(
+                        editor_cx.buffer_text(),
+                        if failed {
+                            "abcq"
+                        } else if operation == PersistenceOperation::Reload {
+                            "abc"
+                        } else {
+                            "abcPq"
+                        }
+                    );
+                    assert_eq!(
+                        fs.load(path!("/root/file").as_ref())
+                            .await
+                            .expect("saved file"),
+                        if !failed && operation == PersistenceOperation::Save {
+                            "abcPq"
+                        } else {
+                            "abc"
+                        }
+                    );
+                    if operation == PersistenceOperation::SaveAs {
+                        if failed {
+                            assert!(!fs.is_file(path!("/root/copy").as_ref()).await);
+                        } else {
+                            assert_eq!(
+                                fs.load(path!("/root/copy").as_ref())
+                                    .await
+                                    .expect("saved copy"),
+                                "abcPq"
+                            );
+                        }
+                    }
+                    editor_cx.update(|window, _| window.remove_window());
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_pane_close_waits_for_pending_clipboard_input(cx: &mut TestAppContext) {
+        init_test(cx, |settings| {
+            settings.defaults.ensure_final_newline_on_save = Some(false);
+        });
+        for (failed, shared, save_before_poll) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/root"), serde_json::json!({ "file": "abc" }))
+                .await;
+            let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+            let (workspace, workspace_cx) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+            let editor = workspace
+                .update_in(workspace_cx, |workspace, window, cx| {
+                    workspace.open_abs_path(
+                        PathBuf::from(path!("/root/file")),
+                        OpenOptions::default(),
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .expect("open saved file")
+                .downcast::<Editor>()
+                .expect("workspace editor");
+            let pane =
+                workspace.read_with(workspace_cx, |workspace, _| workspace.active_pane().clone());
+            let mut editor_cx = EditorTestContext::for_editor_in(editor, workspace_cx).await;
+            editor_cx.set_selections_state("abcˇ");
+            assert!(!editor_cx.editor(|editor, _, cx| Item::is_dirty(editor, cx)));
+            let sibling = shared.then(|| {
+                let editor = editor_cx
+                    .update_editor(|editor, window, cx| cx.new(|cx| editor.clone(window, cx)));
+                let pane = workspace.update_in(workspace_cx, |workspace, window, cx| {
+                    workspace.split_pane(pane.clone(), SplitDirection::Right, window, cx)
+                });
+                pane.update_in(workspace_cx, |pane, window, cx| {
+                    pane.add_item(Box::new(editor.clone()), true, true, None, window, cx);
+                });
+                (pane, editor)
+            });
+            let weak_editor = editor_cx.editor.downgrade();
+            let item_id = editor_cx.editor.entity_id();
+            let (resolver, completion) = queue_pending_clipboard_input(&mut editor_cx);
+            if save_before_poll {
+                let (sender, receiver) = oneshot::channel();
+                editor_cx.update_editor(|editor, window, cx| {
+                    let workspace = workspace.clone();
+                    editor.schedule_input_continuation(window, cx, move |window, cx| {
+                        let save = workspace.update(cx, |workspace, cx| {
+                            workspace.save_active_item(SaveIntent::SaveWithoutFormat, window, cx)
+                        });
+                        assert!(sender.send(save).is_ok());
+                    });
+                });
+                resolver.resolve(Err(ClipboardReadError::Unavailable));
+                let input_error = completion.await.expect_err("failed capture");
+                let save = receiver
+                    .await
+                    .expect("workspace save requested during input");
+                assert_eq!(
+                    save.await
+                        .expect_err("workspace save must retain the preceding input failure")
+                        .root_cause()
+                        .to_string(),
+                    input_error.root_cause().to_string()
+                );
+                editor_cx.assert_editor_state("abcqˇ");
+                assert_eq!(
+                    fs.load(path!("/root/file").as_ref())
+                        .await
+                        .expect("unsaved file"),
+                    "abc"
+                );
+                workspace_cx.update(|window, _| window.remove_window());
+                continue;
+            }
+            drop(editor_cx);
+            let mut close = pane.update_in(workspace_cx, |pane, window, cx| {
+                pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
+            });
+            workspace_cx.run_until_parked();
+            workspace_cx.update(|window, cx| window.draw(cx).clear(cx));
+            workspace_cx.run_until_parked();
+            assert!(
+                (&mut close).now_or_never().is_none(),
+                "failed={failed}, shared={shared}: close completed before input"
+            );
+            assert_eq!(pane.read_with(workspace_cx, |pane, _| pane.items_len()), 1);
+            assert!(weak_editor.upgrade().is_some());
+            assert!(!workspace_cx.has_pending_prompt());
+            resolver.resolve(if failed {
+                Err(ClipboardReadError::Unavailable)
+            } else {
+                Ok(Arc::new(clipboard_snapshot(Some("P"))))
+            });
+            assert_eq!(completion.await.is_err(), failed);
+            workspace_cx.run_until_parked();
+            if failed {
+                close.await.expect_err("failed capture must abort close");
+                assert_eq!(pane.read_with(workspace_cx, |pane, _| pane.items_len()), 1);
+                assert_eq!(
+                    weak_editor
+                        .read_with(workspace_cx, |editor, cx| editor.text(cx))
+                        .expect("editor retained after failed close"),
+                    "abcq"
+                );
+            } else {
+                assert_eq!(workspace_cx.has_pending_prompt(), !shared);
+                if !shared {
+                    workspace_cx.simulate_prompt_answer("Save");
+                }
+                close.await.expect("close after completed input");
+                assert_eq!(pane.read_with(workspace_cx, |pane, _| pane.items_len()), 0);
+                workspace_cx.update(|window, cx| window.draw(cx).clear(cx));
+                workspace_cx
+                    .executor()
+                    .advance_clock(workspace::SERIALIZATION_THROTTLE_TIME);
+                workspace_cx.run_until_parked();
+                assert!(
+                    weak_editor.upgrade().is_none(),
+                    "failed={failed}, shared={shared}: closed editor retained after serialization"
+                );
+                if let Some((pane, editor)) = sibling {
+                    assert_eq!(
+                        editor.read_with(workspace_cx, |editor, cx| editor.text(cx)),
+                        "abcPq"
+                    );
+                    assert_eq!(
+                        fs.load(path!("/root/file").as_ref())
+                            .await
+                            .expect("unsaved file"),
+                        "abc"
+                    );
+                    let close = pane.update_in(workspace_cx, |pane, window, cx| {
+                        pane.close_item_by_id(editor.entity_id(), SaveIntent::Close, window, cx)
+                    });
+                    workspace_cx.run_until_parked();
+                    assert!(workspace_cx.has_pending_prompt());
+                    workspace_cx.simulate_prompt_answer("Save");
+                    close.await.expect("close last shared editor");
+                }
+            }
+            assert_eq!(
+                fs.load(path!("/root/file").as_ref())
+                    .await
+                    .expect("file after close"),
+                if failed { "abc" } else { "abcPq" }
+            );
+            workspace_cx.update(|window, _| window.remove_window());
+        }
+    }
+
+    pub(super) struct TestClipboardPublication(
+        pub(super) Box<dyn Fn(&ClipboardItem) -> Task<Result<Option<ClipboardRevision>>>>,
+    );
+
+    impl Global for TestClipboardPublication {}
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PersistenceOperation {
+        Save,
+        SaveAs,
+        Reload,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PasteIngress {
+        Direct,
+        Action,
+        RegisteredAction,
+        RegisteredKeyboard,
+    }
+
+    async fn clipboard_test_context(
+        ingress: PasteIngress,
+        cx: &mut TestAppContext,
+    ) -> (EditorTestContext, Option<Subscription>) {
+        let mut cx = EditorTestContext::new(cx).await;
+        let subscription = if ingress == PasteIngress::RegisteredAction
+            || ingress == PasteIngress::RegisteredKeyboard
+        {
+            Some(cx.update_editor(|editor, _, cx| {
+                let handle = cx.weak_entity();
+                let subscription = editor.register_action(move |action: &Paste, window, cx| {
+                    handle
+                        .update(cx, |editor, cx| editor.paste(action, window, cx))
+                        .expect("registered editor is alive");
+                });
+                cx.notify();
+                subscription
+            }))
+        } else {
+            None
+        };
+        cx.update(|window, cx| {
+            cx.bind_keys([KeyBinding::new("ctrl-v", Paste, Some("Editor"))]);
+            window.draw(cx).clear(cx);
+        });
+        (cx, subscription)
+    }
+
+    fn start_deferred_clipboard_input(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) {
+        editor.update(cx, |editor, cx| {
+            editor.set_soft_wrap_mode(SoftWrap::None, cx);
+            editor.set_text(format!("ab\n{}\ncd", "x".repeat(2_000)), window, cx);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(0, 1)..Point::new(0, 1)]);
+            });
+            editor.move_down(&MoveDown, window, cx);
+            assert!(editor.input_is_deferred(cx));
+        });
+    }
+
+    fn dispatch_paste(
+        ingress: PasteIngress,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        match ingress {
+            PasteIngress::Direct => {
+                editor.update(cx, |editor, cx| editor.paste(&Paste, window, cx));
+            }
+            PasteIngress::Action | PasteIngress::RegisteredAction => {
+                editor
+                    .read(cx)
+                    .focus_handle
+                    .clone()
+                    .dispatch_action(&Paste, window, cx);
+            }
+            PasteIngress::RegisteredKeyboard => {
+                window.dispatch_keystroke(Keystroke::parse("ctrl-v").expect("paste keystroke"), cx);
+            }
+        }
+    }
+
+    fn queue_pending_clipboard_input(
+        editor_cx: &mut EditorTestContext,
+    ) -> (ClipboardSnapshotResolver, Task<Result<()>>) {
+        let (read, resolver) = ClipboardSnapshotRead::pending();
+        let completion = editor_cx.update_editor(|editor, window, cx| {
+            let capture = cx.global::<ClipboardChannels>().clipboard().capture(
+                None,
+                ClipboardReadMode::Contents,
+                |_| read,
+            );
+            CapturedInput {
+                clipboard: Some(capture),
+                ..CapturedInput::default()
+            }
+            .run(cx, |cx| editor.paste(&Paste, window, cx));
+            editor.replace_text_in_range(None, "q", window, cx);
+            assert!(editor.shared_input_is_deferred());
+            editor.input_completion(cx)
+        });
+        (resolver, completion)
+    }
+
+    fn clipboard_snapshot(text: Option<&str>) -> ClipboardSnapshot {
+        ClipboardSnapshot {
+            item: text.map(|text| ClipboardItem::new_string(text.to_owned())),
+            revision: Some(ClipboardRevision::default()),
+        }
+    }
+
+    fn publish_clipboard(
+        native: &RefCell<ClipboardSnapshot>,
+        item: ClipboardItem,
+    ) -> Result<Option<ClipboardRevision>> {
+        let revision = ClipboardRevision::default();
+        *native.borrow_mut() = ClipboardSnapshot {
+            item: Some(item),
+            revision: Some(revision.clone()),
+        };
+        Ok(Some(revision))
+    }
 }
