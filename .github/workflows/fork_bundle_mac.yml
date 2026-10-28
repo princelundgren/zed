@@ -1,0 +1,46 @@
+name: Fork bundle (macOS)
+
+# The fork's only active workflow: builds an ad-hoc-signed Zed Dev DMG from one of this fork's
+# branches on a GitHub-hosted runner.
+on:
+  workflow_dispatch:
+    inputs:
+      # A branch only: a commit SHA resolves across the whole fork network, so anyone's commit
+      # could be fetched through this fork.
+      branch:
+        description: Branch of this fork to build
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-bundle-mac
+
+jobs:
+  bundle:
+    runs-on: macos-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/${{ inputs.branch }}
+          persist-credentials: false
+
+      - name: Bundle
+        run: script/bundle-mac
+
+      - name: Checksum
+        run: |
+          {
+            echo '```'
+            shasum -a 256 target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zed-dev-${{ github.run_number }}
+          path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+          if-no-files-found: error
+          retention-days: 14
