@@ -44,7 +44,9 @@ Not supported: other events, hook types other than `command`, and hooks that set
 `shell` or `async`, which are skipped. An `ask` decision refuses the tool, since a terminal or
 file write carries no prompt to answer it on. File reads aren't hooked, and neither are tool
 calls the agent runs itself, such as MCP calls, web fetches or files it writes without Zed.
-Hooks run through `sh`, on macOS and Linux.
+Hooks run through `sh`, on macOS and Linux. They don't run at all when Zed connects through its
+newer ACP client, which it does when its `acp-beta` feature flag is on (for Zed staff, debug
+builds, or accounts Zed's server enables it for), and nothing warns that they are off.
 
 Branches: `build` (the default) holds this README and the fork's workflows, `acp-hooks` holds
 the hooks on top of upstream Zed. Builds come from the fork's manually run workflows:
