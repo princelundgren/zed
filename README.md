@@ -44,7 +44,9 @@ Not supported: other events, hook types other than `command`, and hooks that set
 `shell` or `async`, which are skipped. An `ask` decision refuses the tool, since a terminal or
 file write carries no prompt to answer it on. File reads aren't hooked, and neither are tool
 calls the agent runs itself, such as MCP calls, web fetches or files it writes without Zed.
-Hooks run through `sh`, on macOS and Linux. Zed's newer ACP client, behind its `acp-beta` feature
+Hooks run through `/bin/sh`, on macOS and Linux. A terminal command that hooks approved runs
+with your terminal settings only, not the project's, activates no Python environment, and starts
+its shell non-interactively. Zed's newer ACP client, behind its `acp-beta` feature
 flag, runs no hooks, so an agent with hooks configured always connects through the ACP v1
 client; one connected before its hooks were added runs without them until it reconnects.
 
