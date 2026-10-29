@@ -394,6 +394,7 @@ dependencies = [
  "language_model",
  "log",
  "project",
+ "regex",
  "release_channel",
  "remote",
  "reqwest_client",
