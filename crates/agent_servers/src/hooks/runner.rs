@@ -1,7 +1,7 @@
 use std::{io, path::Path, pin::pin};
 
 use futures::{
-    AsyncWriteExt as _,
+    AsyncRead, AsyncReadExt as _, AsyncWriteExt as _,
     future::{self, Either},
 };
 use gpui::BackgroundExecutor;
@@ -84,17 +84,52 @@ async fn run_hook(
             log::warn!("writing hook input to {:?}: {error}", command.command);
         }
     };
-    let finished = pin!(future::join(write_input, child.output()));
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let status = child.status();
+    let finished = pin!(future::join(
+        write_input,
+        future::try_join3(read_capped(stdout), read_capped(stderr), status),
+    ));
 
-    // Dropping the unfinished output future drops the child, which kill_on_drop kills.
+    // Returning on a timeout drops the child, which kill_on_drop kills.
     match future::select(finished, executor.timer(command.timeout)).await {
-        Either::Left(((_, Ok(output)), _)) => HookRun::Exited {
-            code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        // Exit 2 blocks with stderr whatever stdout holds; otherwise a cut-off stdout could read
+        // as plain text and let a deny through.
+        Either::Left(((_, Ok(((_, true), _, status))), _)) if status.code() != Some(2) => {
+            HookRun::Failed(format!("printed more than {OUTPUT_LIMIT} bytes on stdout"))
+        }
+        Either::Left(((_, Ok(((stdout, _), (stderr, _), status))), _)) => HookRun::Exited {
+            code: status.code(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         },
         Either::Left(((_, Err(error)), _)) => HookRun::Failed(error.to_string()),
         Either::Right(_) => HookRun::TimedOut,
+    }
+}
+
+/// The most of a hook's stdout or stderr that is kept; the rest is read and dropped, so the hook
+/// isn't blocked on a full pipe.
+const OUTPUT_LIMIT: usize = 1 << 20;
+
+/// Reads `stream` to its end, keeping up to [`OUTPUT_LIMIT`] bytes, and says whether any were
+/// dropped.
+async fn read_capped(stream: Option<impl AsyncRead + Unpin>) -> io::Result<(Vec<u8>, bool)> {
+    let mut kept = Vec::new();
+    let mut truncated = false;
+    let Some(mut stream) = stream else {
+        return Ok((kept, truncated));
+    };
+    let mut buffer = [0; 8192];
+    loop {
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok((kept, truncated));
+        }
+        let room = OUTPUT_LIMIT.saturating_sub(kept.len());
+        truncated |= read > room;
+        kept.extend_from_slice(&buffer[..read.min(room)]);
     }
 }
 
@@ -167,6 +202,37 @@ mod tests {
         let input = json!({ "prompt": "x".repeat(1 << 20) });
         let result = run("exit 0", input, cx).await;
         assert_eq!(result, exited(0, "", ""));
+    }
+
+    #[gpui::test]
+    async fn stdout_past_the_limit_is_a_failure(cx: &mut TestAppContext) {
+        let command = format!("head -c {} /dev/zero | tr '\\0' x", OUTPUT_LIMIT + 1);
+        let result = run(&command, json!({}), cx).await;
+        assert_eq!(
+            result,
+            HookRun::Failed(format!("printed more than {OUTPUT_LIMIT} bytes on stdout"))
+        );
+    }
+
+    #[gpui::test]
+    async fn stderr_past_the_limit_is_cut_and_exit_2_still_blocks(cx: &mut TestAppContext) {
+        let command = format!(
+            "head -c {} /dev/zero | tr '\\0' x >&2; head -c {} /dev/zero | tr '\\0' y; exit 2",
+            OUTPUT_LIMIT * 2,
+            OUTPUT_LIMIT * 2
+        );
+        let HookRun::Exited {
+            code,
+            stdout,
+            stderr,
+        } = run(&command, json!({}), cx).await
+        else {
+            panic!("the hook exits");
+        };
+        assert_eq!(code, Some(2));
+        assert_eq!(stdout.len(), OUTPUT_LIMIT);
+        assert_eq!(stderr.len(), OUTPUT_LIMIT);
+        assert!(stderr.bytes().all(|byte| byte == b'x'));
     }
 
     #[gpui::test]
