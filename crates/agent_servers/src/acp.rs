@@ -131,7 +131,11 @@ pub async fn connect(
     default_config_options: HashMap<String, settings::AgentConfigOptionValue>,
     cx: &mut AsyncApp,
 ) -> Result<Rc<dyn acp_thread::AgentConnection>> {
-    let negotiation_error = if cx.update(|cx| cx.has_flag::<AcpBetaFeatureFlag>()) {
+    // The v2 client runs no hooks, so an agent with hooks stays on v1, where they run.
+    let try_v2 = cx.update(|cx| {
+        cx.has_flag::<AcpBetaFeatureFlag>() && !crate::hooks::agent_has_hooks(&agent_id, cx)
+    });
+    let negotiation_error = if try_v2 {
         match AcpV2Connection::stdio(
             agent_id.clone(),
             project.clone(),
@@ -1175,6 +1179,95 @@ mod selection_tests {
             });
         });
         assert_eq!(cx.has_flag::<AcpBetaFeatureFlag>(), enabled);
+    }
+
+    #[gpui::test]
+    async fn beta_selection_keeps_an_agent_with_hooks_on_v1(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut store = settings::SettingsStore::test(cx);
+            store.register_setting::<feature_flags::FeatureFlagsSettings>();
+            cx.set_global(store);
+            release_channel::init("0.0.0".parse().expect("version"), cx);
+            let hooks = json!({
+                "agent_servers": {
+                    "selection": {
+                        "type": "custom",
+                        "command": "unused",
+                        "hooks": {
+                            "Stop": [{ "hooks": [{ "type": "command", "command": "true" }] }],
+                        },
+                    },
+                },
+            });
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(&hooks.to_string(), cx)
+                    .expect("hook settings");
+            });
+            set_beta(true, cx);
+        });
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("working directory");
+        let project = Project::example([directory.path()], &mut cx.to_async()).await;
+        let trace = directory.path().join("connections");
+        // Answers whichever protocol version Zed asks for, so only Zed's choice decides.
+        let command = AgentServerCommand {
+            path: "/bin/sh".into(),
+            args: vec!["-c".into(), r#"
+while IFS= read -r request; do
+    case "$request" in
+        *'"method":"initialize"'*)
+            id=${request#*\"id\":}; id=${id%%,*}
+            case "$request" in
+                *'"protocolVersion":2'*)
+                    printf 'initialize 2\n' >> "$ACP_SELECTION_TRACE"
+                    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":2,"info":{"name":"selected-v2","version":"1"},"capabilities":{"session":{}}}}\n' "$id"
+                    ;;
+                *)
+                    printf 'initialize 1\n' >> "$ACP_SELECTION_TRACE"
+                    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"selected-v1","version":"1"}}}\n' "$id"
+                    ;;
+            esac
+            ;;
+    esac
+done
+"#.into()],
+            env: Some(HashMap::from_iter([(
+                "ACP_SELECTION_TRACE".into(),
+                trace.to_string_lossy().into_owned(),
+            )])),
+        };
+
+        let connecting = cx.spawn({
+            let project = project.clone();
+            async move |mut cx| {
+                connect(
+                    AgentId::new("selection"),
+                    project,
+                    command,
+                    WeakEntity::new_invalid(),
+                    None,
+                    HashMap::default(),
+                    &mut cx,
+                )
+                .await
+            }
+        });
+        let timeout = cx
+            .background_executor
+            .timer(std::time::Duration::from_secs(10));
+        futures::pin_mut!(connecting, timeout);
+        let connection = match futures::future::select(connecting, timeout).await {
+            futures::future::Either::Left((result, _)) => result.expect("selected connection"),
+            _ => panic!("selection timed out"),
+        };
+
+        assert!(connection.clone().downcast::<AcpV2Connection>().is_none());
+        assert_eq!(
+            std::fs::read_to_string(&trace).expect("selection trace"),
+            "initialize 1\n"
+        );
+        connection.shutdown();
     }
 
     #[gpui::test]

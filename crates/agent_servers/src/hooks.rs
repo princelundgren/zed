@@ -239,14 +239,9 @@ impl LiveAgentHooks {
     }
 
     fn refresh_from_settings(&self, agent_id: &AgentId, cx: &App) {
-        let Some(settings_store) = cx.try_global::<SettingsStore>() else {
+        let Some(content) = configured_hooks(agent_id, cx) else {
             return;
         };
-        let content = settings_store
-            .get::<AllAgentServersSettings>(None)
-            .get(agent_id.as_ref())
-            .map(|settings| settings.hooks().clone())
-            .unwrap_or_default();
         let mut loaded = self.0.borrow_mut();
         // Unchanged hooks aren't rebuilt, so their warnings aren't logged on every settings change.
         if loaded.content != content {
@@ -259,6 +254,28 @@ impl LiveAgentHooks {
     pub fn matching(&self, event: HookEvent, subject: &str) -> Vec<HookCommand> {
         self.0.borrow().hooks.matching(event, subject)
     }
+}
+
+/// Whether the user's settings give `agent_id` any hook, including ones Zed skips.
+pub fn agent_has_hooks(agent_id: &AgentId, cx: &App) -> bool {
+    configured_hooks(agent_id, cx).is_some_and(|content| {
+        content
+            .values()
+            .flatten()
+            .any(|group| !group.hooks.is_empty())
+    })
+}
+
+/// `agent_id`'s hooks in the user's settings, or `None` before settings are loaded.
+fn configured_hooks(agent_id: &AgentId, cx: &App) -> Option<AgentHooksContent> {
+    let settings_store = cx.try_global::<SettingsStore>()?;
+    Some(
+        settings_store
+            .get::<AllAgentServersSettings>(None)
+            .get(agent_id.as_ref())
+            .map(|settings| settings.hooks().clone())
+            .unwrap_or_default(),
+    )
 }
 
 /// Runs `PreToolUse` hooks in `project_dir` for a shell command the agent asked Zed to start in
