@@ -59,6 +59,7 @@ tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 ui.workspace = true
 terminal.workspace = true
+text.workspace = true
 uuid.workspace = true
 util.workspace = true
 watch.workspace = true

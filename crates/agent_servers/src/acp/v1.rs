@@ -9027,6 +9027,371 @@ exit 7
         );
     }
 
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn pre_tool_use_hook_denies_a_file_write(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let _thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("hooks-session"),
+                    project,
+                    PathList::new(&[project_dir.path()]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load hooks session");
+        let input_path = project_dir.path().join("hook-input.json");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "PreToolUse": [hook_group(
+                    "Edit|Write",
+                    format!(
+                        "cat > '{}'; echo 'no dotfiles' >&2; exit 2",
+                        input_path.display()
+                    ),
+                )],
+            }),
+            cx,
+        );
+        cx.executor().allow_parking();
+        let target = project_dir.path().join(".zshrc");
+
+        let error = agent
+            .send_request(acp::WriteTextFileRequest::new(
+                acp::SessionId::new("hooks-session"),
+                project_dir.path().join(".").join(".zshrc"),
+                "# task0\n",
+            ))
+            .block_task()
+            .await
+            .expect_err("the hook denies the write");
+
+        assert_eq!(error.data, Some(serde_json::json!("no dotfiles")));
+        assert_eq!(
+            read_hook_input(&input_path),
+            serde_json::json!({
+                "session_id": "hooks-session",
+                "cwd": project_dir.path(),
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": { "file_path": target, "content": "# task0\n" },
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn a_write_a_hook_allows_saves_the_path_and_text_it_was_shown(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        let fs = project.read_with(cx, |project, _| project.fs().clone());
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let _thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("hooks-session"),
+                    project,
+                    PathList::new(&[project_dir.path()]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load hooks session");
+        let input_path = project_dir.path().join("hook-input.json");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "PreToolUse": [hook_group(
+                    "Write",
+                    format!("cat > '{}'; exit 0", input_path.display()),
+                )],
+            }),
+            cx,
+        );
+        cx.executor().allow_parking();
+
+        // The fake project's worktree is `/a` on its in-memory filesystem. A lone `\r` is a line
+        // break once in the buffer, so the hook must read it as one.
+        agent
+            .send_request(acp::WriteTextFileRequest::new(
+                acp::SessionId::new("hooks-session"),
+                "/a/./notes.md",
+                "#\recho ran\n",
+            ))
+            .block_task()
+            .await
+            .expect("the hook allows the write");
+
+        assert_eq!(
+            read_hook_input(&input_path)["tool_input"],
+            serde_json::json!({ "file_path": "/a/notes.md", "content": "#\necho ran\n" })
+        );
+        assert_eq!(
+            fs.load(std::path::Path::new("/a/notes.md"))
+                .await
+                .expect("written file"),
+            "#\necho ran\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn file_write_hook_sees_where_a_symlink_leads(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        let fs = project.read_with(cx, |project, _| project.fs().as_fake());
+        fs.insert_tree("/home", serde_json::json!({ ".ssh": {} }))
+            .await;
+        fs.insert_symlink("/a/keys", PathBuf::from("/home/.ssh"))
+            .await;
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let _thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("hooks-session"),
+                    project,
+                    PathList::new(&[project_dir.path()]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load hooks session");
+        let input_path = project_dir.path().join("hook-input.json");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "PreToolUse": [hook_group(
+                    "Write",
+                    format!("cat > '{}'; exit 2", input_path.display()),
+                )],
+            }),
+            cx,
+        );
+        cx.executor().allow_parking();
+
+        agent
+            .send_request(acp::WriteTextFileRequest::new(
+                acp::SessionId::new("hooks-session"),
+                "/a/keys/authorized_keys",
+                "key\n",
+            ))
+            .block_task()
+            .await
+            .expect_err("the hook denies the write");
+
+        assert_eq!(
+            read_hook_input(&input_path)["tool_input"]["file_path"],
+            "/home/.ssh/authorized_keys"
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn file_write_through_a_symlink_to_a_missing_file_is_refused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        let fs = project.read_with(cx, |project, _| project.fs().as_fake());
+        fs.insert_tree("/home", serde_json::json!({ ".ssh": {} }))
+            .await;
+        fs.insert_symlink("/a/new.md", PathBuf::from("/home/.ssh/authorized_keys"))
+            .await;
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let _thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("hooks-session"),
+                    project,
+                    PathList::new(&[project_dir.path()]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load hooks session");
+        set_test_agent_hooks(
+            serde_json::json!({ "PreToolUse": [hook_group("Write", "exit 0".into())] }),
+            cx,
+        );
+        cx.executor().allow_parking();
+
+        let error = agent
+            .send_request(acp::WriteTextFileRequest::new(
+                acp::SessionId::new("hooks-session"),
+                "/a/new.md",
+                "key\n",
+            ))
+            .block_task()
+            .await
+            .expect_err("a write no hook was shown the target of");
+
+        assert!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.as_str())
+                .is_some_and(|data| data.contains("a symlink to a missing file")),
+            "{error:?}"
+        );
+        assert!(
+            fs.load(std::path::Path::new("/home/.ssh/authorized_keys"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn hooked_write_refuses_a_file_changed_since_the_agent_read_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        let fs = project.read_with(cx, |project, _| project.fs().clone());
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let _thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("hooks-session"),
+                    project,
+                    PathList::new(&[project_dir.path()]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load hooks session");
+        set_test_agent_hooks(
+            serde_json::json!({ "PreToolUse": [hook_group("Write", "exit 0".into())] }),
+            cx,
+        );
+        cx.executor().allow_parking();
+        let write = |content: &str| {
+            agent
+                .send_request(acp::WriteTextFileRequest::new(
+                    acp::SessionId::new("hooks-session"),
+                    "/a/notes.md",
+                    content,
+                ))
+                .block_task()
+        };
+
+        write("one\n").await.expect("first write");
+        agent
+            .send_request(acp::ReadTextFileRequest::new(
+                acp::SessionId::new("hooks-session"),
+                "/a/notes.md",
+            ))
+            .block_task()
+            .await
+            .expect("read");
+        write("two\n")
+            .await
+            .expect("a write over the text just read");
+        let error = write("three\n")
+            .await
+            .expect_err("a write over text the agent hasn't read");
+
+        assert!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.as_str())
+                .is_some_and(|data| data.contains("changed since the agent last read it")),
+            "{error:?}"
+        );
+        assert_eq!(
+            fs.load(std::path::Path::new("/a/notes.md"))
+                .await
+                .expect("written file"),
+            "two\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn pre_tool_use_ask_refuses_a_file_write(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let _thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("hooks-session"),
+                    project,
+                    PathList::new(&[project_dir.path()]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load hooks session");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "PreToolUse": [hook_group(
+                    "Write",
+                    r#"echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask"}}'"#
+                        .into(),
+                )],
+            }),
+            cx,
+        );
+        cx.executor().allow_parking();
+        let target = project_dir.path().join("notes.md");
+
+        let error = agent
+            .send_request(acp::WriteTextFileRequest::new(
+                acp::SessionId::new("hooks-session"),
+                target.clone(),
+                "text",
+            ))
+            .block_task()
+            .await
+            .expect_err("an ask refuses the write");
+
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!(
+                "a PreToolUse hook asked to confirm this write, and Zed can't ask before writing \
+                 a file"
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_file_path_has_one_spelling_and_refuses_parent_dirs() {
+        assert_eq!(
+            hook_file_path(std::path::Path::new("/repo/./src//main.rs/")),
+            Some(PathBuf::from("/repo/src/main.rs"))
+        );
+        assert_eq!(
+            hook_file_path(std::path::Path::new("/repo/../home/.zshrc")),
+            None
+        );
+        assert_eq!(hook_file_path(std::path::Path::new("repo/main.rs")), None);
+    }
+
     #[test]
     fn a_terminal_without_args_reaches_hooks_as_its_shell_text() {
         let request =
@@ -10898,19 +11263,85 @@ fn handle_write_text_file(
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) {
-    let thread = match session_thread(ctx, &acp_v2::SessionId::new(args.session_id.0)) {
+    let session_id = acp_v2::SessionId::new(args.session_id.0.clone());
+    let thread = match session_thread(ctx, &session_id) {
         Ok(t) => t,
         Err(e) => return respond_err(responder, e),
     };
+    let (project, project_dir) = match thread
+        .read_with(cx, |thread, _cx| {
+            (thread.project().clone(), session_project_dir(thread))
+        })
+        .map_err(acp::Error::from)
+    {
+        Ok(p) => p,
+        Err(e) => return respond_err(responder, e),
+    };
+    let hook_commands = ctx.hooks.matching(hooks::HookEvent::PreToolUse, "Write");
 
     cx.spawn(async move |cx| {
         let result: Result<_, acp::Error> = async {
-            thread
-                .update(cx, |thread, cx| {
+            let write = if hook_commands.is_empty() {
+                thread.update(cx, |thread, cx| {
                     thread.write_text_file(args.path, args.content, cx)
                 })
-                .map_err(acp::Error::from)?
-                .await?;
+            } else {
+                let project_dir = pre_tool_use_hook_dir(project_dir, &project, cx)?;
+                let path = hook_file_path(&args.path).ok_or_else(|| {
+                    acp::Error::internal_error().data(format!(
+                        "the file path {} must be absolute and without `..` for PreToolUse \
+                         hooks to read it",
+                        args.path.display()
+                    ))
+                })?;
+                let fs = project.read_with(cx, |project, _| project.fs().clone());
+                let resolved_path =
+                    resolved_file_path(fs.as_ref(), &path)
+                        .await
+                        .ok_or_else(|| {
+                            acp::Error::internal_error().data(format!(
+                                "the file path {} leads through something Zed can't resolve, \
+                                 such as a symlink to a missing file, so PreToolUse hooks \
+                                 can't be shown the file it writes",
+                                path.display()
+                            ))
+                        })?;
+                let file_path = resolved_path.to_str().ok_or_else(|| {
+                    acp::Error::internal_error().data(format!(
+                        "the file path {} resolves to a path that isn't UTF-8",
+                        path.display()
+                    ))
+                })?;
+                // The buffer stores line breaks as `\n`, so the hook reads the text that is saved.
+                let mut content = args.content;
+                text::LineEnding::normalize(&mut content);
+                let decision = hooks::file_write_decision(
+                    hook_commands,
+                    &session_id.0,
+                    &project_dir,
+                    file_path,
+                    &content,
+                    cx.background_executor(),
+                )
+                .await;
+                match decision {
+                    ToolDecision::Deny { reason } => {
+                        return Err(acp::Error::internal_error().data(reason));
+                    }
+                    // A file write carries no tool call to show a prompt on.
+                    ToolDecision::Ask => {
+                        return Err(acp::Error::internal_error().data(
+                            "a PreToolUse hook asked to confirm this write, and Zed can't ask \
+                             before writing a file",
+                        ));
+                    }
+                    ToolDecision::Allow | ToolDecision::Undecided => {}
+                }
+                thread.update(cx, |thread, cx| {
+                    thread.write_text_file_over_last_read(path, content, cx)
+                })
+            };
+            write.map_err(acp::Error::from)?.await?;
             Ok(())
         }
         .await;
@@ -11326,16 +11757,7 @@ fn handle_create_terminal(
                     format!("{} {}", args.command, args.args.join(" ")),
                 )
             } else {
-                let project_dir = project_dir.ok_or_else(|| {
-                    acp::Error::internal_error()
-                        .data("the session has no working directory to run PreToolUse hooks in")
-                })?;
-                if !project.read_with(cx, |project, _| project.is_local()) {
-                    return Err(acp::Error::internal_error().data(
-                        "PreToolUse hooks run on this machine, so they can't guard a terminal \
-                         in a remote project",
-                    ));
-                }
+                let project_dir = pre_tool_use_hook_dir(project_dir, &project, cx)?;
                 let cwd = match args.cwd.clone() {
                     Some(cwd) if cwd.is_absolute() => cwd,
                     Some(cwd) => {
@@ -11423,6 +11845,65 @@ fn handle_create_terminal(
         }
     })
     .detach();
+}
+
+/// The path Zed writes when `PreToolUse` hooks apply: the agent's, without `.` components or
+/// repeated separators. `None` for a relative path or one with `..`, which the filesystem
+/// resolves after any symlink before it.
+fn hook_file_path(path: &std::path::Path) -> Option<PathBuf> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+    Some(path.components().collect())
+}
+
+/// `path` as the filesystem resolves it, which `PreToolUse` hooks are shown so they judge the
+/// file a write lands on: the on-disk case, with symlinks followed, for the part that exists. A
+/// part that doesn't exist yet, such as a new file's name, is kept as written. `None` when
+/// something is at a part of the path but doesn't resolve, such as a symlink to a missing file,
+/// which a write would create wherever it points.
+async fn resolved_file_path(fs: &dyn fs::Fs, path: &std::path::Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        if let Ok(resolved) = fs.canonicalize(ancestor).await {
+            return Some(match path.strip_prefix(ancestor) {
+                Ok(rest) if !rest.as_os_str().is_empty() => resolved.join(rest),
+                _ => resolved,
+            });
+        }
+        if !is_absent(fs, ancestor).await {
+            return None;
+        }
+    }
+    None
+}
+
+/// Whether nothing is at `path`, not even a symlink to a missing file.
+async fn is_absent(fs: &dyn fs::Fs, path: &std::path::Path) -> bool {
+    matches!(fs.metadata(path).await, Ok(None)) && fs.read_link(path).await.is_err()
+}
+
+/// The directory `PreToolUse` hooks run in for a terminal or file write the agent asked Zed for:
+/// the session's working directory. Hooks run on this machine, so a remote project refuses the
+/// tool.
+fn pre_tool_use_hook_dir(
+    project_dir: Option<PathBuf>,
+    project: &Entity<Project>,
+    cx: &mut AsyncApp,
+) -> Result<PathBuf, acp::Error> {
+    let project_dir = project_dir.ok_or_else(|| {
+        acp::Error::internal_error()
+            .data("the session has no working directory to run PreToolUse hooks in")
+    })?;
+    if !project.read_with(cx, |project, _| project.is_local()) {
+        return Err(acp::Error::internal_error().data(
+            "PreToolUse hooks run on this machine, so they can't guard a tool in a remote project",
+        ));
+    }
+    Ok(project_dir)
 }
 
 fn handle_kill_terminal(

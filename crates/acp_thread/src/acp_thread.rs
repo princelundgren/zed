@@ -3627,6 +3627,15 @@ fn stop_reason_from_v1(reason: &acp_v1::StopReason) -> Option<acp_v2::StopReason
     })
 }
 
+/// What a file write does when the file's buffer changed since the agent last read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BufferDrift {
+    /// Applies the agent's edits on top, keeping the other changes.
+    Merge,
+    /// Refuses the write.
+    Refuse,
+}
+
 pub struct AcpThread {
     session_info: AgentSessionInfo,
     parent_session_id: Option<acp_v2::SessionId>,
@@ -7882,6 +7891,29 @@ impl AcpThread {
         content: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        self.write_text_file_onto(path, content, BufferDrift::Merge, cx)
+    }
+
+    /// Writes `content` to `path` as [`Self::write_text_file`] does, but fails without writing if
+    /// the file's buffer changed since the agent last read it through Zed, so the text saved is
+    /// `content` before formatting. A file the agent hasn't read is written over what its buffer
+    /// holds.
+    pub fn write_text_file_over_last_read(
+        &self,
+        path: PathBuf,
+        content: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.write_text_file_onto(path, content, BufferDrift::Refuse, cx)
+    }
+
+    fn write_text_file_onto(
+        &self,
+        path: PathBuf,
+        content: String,
+        drift: BufferDrift,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         let project = self.project.clone();
         let action_log = self.action_log.clone();
         let should_update_agent_location = self.parent_session_id.is_none();
@@ -7899,6 +7931,7 @@ impl AcpThread {
                     .cloned()
                     .unwrap_or_else(|| buffer.read(cx).snapshot())
             })?;
+            let last_read_version = snapshot.version().clone();
             let edits = cx
                 .background_executor()
                 .spawn(async move {
@@ -7928,6 +7961,14 @@ impl AcpThread {
             }
 
             let format_on_save = cx.update(|cx| {
+                if drift == BufferDrift::Refuse
+                    && buffer.read(cx).version().changed_since(&last_read_version)
+                {
+                    anyhow::bail!(
+                        "{} changed since the agent last read it; read it again before writing",
+                        path.display()
+                    );
+                }
                 action_log.update(cx, |action_log, cx| {
                     action_log.buffer_read(buffer.clone(), cx);
                 });
@@ -7945,8 +7986,8 @@ impl AcpThread {
                 action_log.update(cx, |action_log, cx| {
                     action_log.buffer_edited(buffer.clone(), cx);
                 });
-                format_on_save
-            });
+                anyhow::Ok(format_on_save)
+            })?;
 
             if format_on_save {
                 let format_task = project.update(cx, |project, cx| {

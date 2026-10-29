@@ -404,6 +404,7 @@ dependencies = [
  "task",
  "tempfile",
  "terminal",
+ "text",
  "thiserror 2.0.17",
  "ui",
  "util",

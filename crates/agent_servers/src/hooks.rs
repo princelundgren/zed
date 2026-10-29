@@ -278,6 +278,26 @@ pub async fn shell_command_decision(
     decision::tool_decision(&runner::run_hooks(commands, &input, project_dir, executor).await)
 }
 
+/// Runs `PreToolUse` hooks in `project_dir` for a file the agent asked Zed to write, as Claude
+/// Code runs them for its `Write` tool: `content` is the file's whole new text.
+pub async fn file_write_decision(
+    commands: Vec<HookCommand>,
+    session_id: &str,
+    project_dir: &Path,
+    file_path: &str,
+    content: &str,
+    executor: &BackgroundExecutor,
+) -> ToolDecision {
+    let mut fields = Map::new();
+    fields.insert("tool_name".into(), "Write".into());
+    fields.insert(
+        "tool_input".into(),
+        json!({ "file_path": file_path, "content": content }),
+    );
+    let input = hook_input(HookEvent::PreToolUse, session_id, project_dir, fields);
+    decision::tool_decision(&runner::run_hooks(commands, &input, project_dir, executor).await)
+}
+
 /// How a session came to be opened, as `SessionStart` hooks are told it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionSource {
