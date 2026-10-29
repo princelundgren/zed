@@ -34,13 +34,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: test-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
       - name: Format
         run: cargo fmt --check
 
       - name: Test
-        run: cargo test -p settings_content -p agent_servers
+        run: cargo test -p settings_content -p agent_servers -p settings_ui
 
       - name: Cache size
         run: du -sh target ~/.cargo/registry ~/.cargo/git >> "$GITHUB_STEP_SUMMARY"
@@ -60,7 +60,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: clippy-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: clippy-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
       - name: Clippy
-        run: cargo clippy -p settings_content -p agent_servers --tests -- --deny warnings
+        run: >-
+          cargo clippy -p settings_content -p project -p agent_servers -p settings_ui
+          -p onboarding -p agent_ui --tests -- --deny warnings
