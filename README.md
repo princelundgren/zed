@@ -5,6 +5,51 @@
 
 Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
 
+### How this fork differs
+
+This fork adds client-side hooks for external ACP agents, in
+[Claude Code's hook format](https://code.claude.com/docs/en/hooks), so a hook script written for
+Claude Code runs unchanged under any ACP agent Zed starts. Apart from that and its build
+workflows, it is upstream Zed.
+
+Hooks are set per agent in your user settings, never a project's, since they run arbitrary
+commands:
+
+```json
+{
+  "agent_servers": {
+    "my-agent": {
+      "type": "custom",
+      "command": "my-agent",
+      "args": ["acp"],
+      "hooks": {
+        "PreToolUse": [
+          { "matcher": "Bash", "hooks": [{ "type": "command", "command": "~/hooks/guard.sh" }] }
+        ]
+      }
+    }
+  }
+}
+```
+
+| Event | When it runs |
+|---|---|
+| `PreToolUse` (`Bash`) | Before Zed starts a terminal command the agent asked for; a deny refuses it |
+| `PreToolUse` (`Write`) | Before Zed writes a file the agent sent through `fs/write_text_file`; a deny refuses it |
+| `UserPromptSubmit` | Before a prompt is sent; it can block the prompt or add context ahead of it |
+| `SessionStart` | When a session starts or is resumed; its output goes ahead of the first prompt |
+| `Stop` | When the agent ends a turn; a block sends its reason back as the next prompt |
+
+Not supported: other events, hook types other than `command`, and hooks that set `args`, `if`,
+`shell` or `async`, which are skipped. An `ask` decision refuses the tool, since a terminal or
+file write carries no prompt to answer it on. File reads aren't hooked, and neither are tool
+calls the agent runs itself, such as MCP calls, web fetches or files it writes without Zed.
+Hooks run through `sh`, on macOS and Linux.
+
+Branches: `build` (the default) holds this README and the fork's workflows, `acp-hooks` holds
+the hooks on top of upstream Zed. Builds come from the fork's manually run workflows:
+`fork_test_hooks.yml` tests a branch and `fork_bundle_mac.yml` builds a macOS app from one.
+
 ---
 
 ### Installation
