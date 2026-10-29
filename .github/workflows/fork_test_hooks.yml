@@ -1,0 +1,66 @@
+name: Fork tests (agent hooks)
+
+# Runs the tests and lints of the crates the agent-hooks work touches, on one of this fork's
+# branches. Dispatched, not on push: a push workflow runs from the pushed branch's own copy, which
+# would have to live on the feature branch.
+on:
+  workflow_dispatch:
+    inputs:
+      # A branch only: a commit SHA resolves across the whole fork network, so anyone's commit
+      # could be fetched through this fork.
+      branch:
+        description: Branch of this fork to test
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-test-hooks-${{ inputs.branch }}
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/${{ inputs.branch }}
+          persist-credentials: false
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Test
+        run: cargo test -p settings_content -p agent_servers
+
+      - name: Cache size
+        run: du -sh target ~/.cargo/registry ~/.cargo/git >> "$GITHUB_STEP_SUMMARY"
+
+  clippy:
+    runs-on: macos-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/${{ inputs.branch }}
+          persist-credentials: false
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: clippy-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Clippy
+        run: cargo clippy -p settings_content -p agent_servers --tests -- --deny warnings
