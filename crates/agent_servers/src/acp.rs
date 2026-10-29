@@ -28,7 +28,7 @@ use agent_client_protocol::{
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
-use futures::{Future, channel::mpsc};
+use futures::{Future, channel::mpsc, future::Shared};
 use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task, WeakEntity};
 use project::agent_server_store::{AgentServerCommand, AgentServerStore};
 use project::context_server_store::ContextServerConfiguration;
@@ -496,6 +496,8 @@ pub struct AcpSession {
     session_modes: Option<Rc<RefCell<acp::SessionModeState>>>,
     config_options: Option<ConfigOptions>,
     default_config_task: Option<Task<()>>,
+    /// What the session's `SessionStart` hooks add, sent ahead of its first prompt.
+    session_start_context: Option<Shared<Task<Vec<String>>>>,
     _release_subscription: Subscription,
 }
 
@@ -871,6 +873,7 @@ fn apply_subagent_update(
             session_modes: None,
             config_options: Some(ConfigOptions::new(Rc::new(RefCell::new(Vec::new())))),
             default_config_task: None,
+            session_start_context: None,
             _release_subscription: release_subscription,
         },
     );

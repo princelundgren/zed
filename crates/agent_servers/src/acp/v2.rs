@@ -792,6 +792,7 @@ impl AcpV2Connection {
                 session_modes: None,
                 config_options: Some(ConfigOptions::new(Rc::new(RefCell::new(Vec::new())))),
                 default_config_task: None,
+                session_start_context: None,
                 _release_subscription: release_subscription,
             },
         );

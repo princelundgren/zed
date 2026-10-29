@@ -49,7 +49,7 @@ use acp_thread::{AcpThread, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
-use crate::hooks::{self, LiveAgentHooks, ToolDecision};
+use crate::hooks::{self, LiveAgentHooks, PromptOutcome, SessionSource, ToolDecision};
 use crate::{CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
@@ -90,6 +90,7 @@ pub struct AcpConnection {
     session_list: Option<Rc<AcpSessionList>>,
     debug_log: AcpDebugLog,
     _settings_subscription: Subscription,
+    hooks: LiveAgentHooks,
     _hooks_subscription: Subscription,
     _runtime: runtime::ClientRuntime,
     dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
@@ -741,6 +742,7 @@ impl AcpConnection {
             session_list,
             debug_log,
             _settings_subscription: settings_subscription,
+            hooks,
             _hooks_subscription: hooks_subscription,
             _runtime: runtime,
             dispatch_tx,
@@ -792,6 +794,7 @@ impl AcpConnection {
             session_list: None,
             debug_log: AcpDebugLog::default(),
             _settings_subscription: settings_subscription,
+            hooks,
             _hooks_subscription: hooks_subscription,
             _runtime: runtime::ClientRuntime::from_test_tasks(
                 dispatch_tx.clone(),
@@ -840,9 +843,51 @@ impl AcpConnection {
                 session_modes,
                 config_options,
                 default_config_task,
+                session_start_context: None,
                 _release_subscription: release_subscription,
             },
         );
+    }
+
+    /// Starts the session's `SessionStart` hooks; its first prompt carries what they add.
+    fn start_session_hooks(
+        &self,
+        session_id: &acp_v2::SessionId,
+        thread: &Entity<AcpThread>,
+        source: SessionSource,
+        cx: &mut App,
+    ) {
+        let commands = self
+            .hooks
+            .matching(hooks::HookEvent::SessionStart, source.name());
+        if commands.is_empty() {
+            return;
+        }
+        let Some(project_dir) = session_project_dir(thread.read(cx)) else {
+            log::warn!(
+                "session {} has no working directory to run SessionStart hooks in",
+                session_id.0
+            );
+            return;
+        };
+        let hook_session_id = session_id.0.clone();
+        let executor = cx.background_executor().clone();
+        let context = cx
+            .foreground_executor()
+            .spawn(async move {
+                hooks::session_start_context(
+                    commands,
+                    &hook_session_id,
+                    &project_dir,
+                    source,
+                    &executor,
+                )
+                .await
+            })
+            .shared();
+        if let Some(session) = self.sessions.borrow_mut().get_mut(session_id) {
+            session.session_start_context = Some(context);
+        }
     }
 
     fn remove_session(&self, session_id: &acp_v2::SessionId, thread_id: gpui::EntityId) {
@@ -1011,6 +1056,7 @@ impl AcpConnection {
             )
         });
         self.register_session(session_id.clone(), &thread, None, None, None, cx);
+        self.start_session_hooks(&session_id, &thread, SessionSource::Resume, cx);
 
         // The connection owns this task, so retaining the thread (which owns the
         // connection) here would keep both alive after all callers abandon the load.
@@ -1465,13 +1511,14 @@ impl AgentConnection for AcpConnection {
 
             cx.update(|cx| {
                 self.register_session(
-                    session_id,
+                    session_id.clone(),
                     &thread,
                     modes,
                     config_options,
                     default_config_task,
                     cx,
-                )
+                );
+                self.start_session_hooks(&session_id, &thread, SessionSource::Startup, cx);
             });
 
             registered
@@ -1661,13 +1708,75 @@ impl AgentConnection for AcpConnection {
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
         let session_id = params.session_id.clone();
-        let params = match acp_thread::content::prompt_to_v1(params) {
+        let mut params = match acp_thread::content::prompt_to_v1(params) {
             Ok(params) => params,
             Err(error) => return Task::ready(Err(error)),
         };
         let conn = self.connection.clone();
         let sessions = self.sessions.clone();
+        let prompt_hooks = self.hooks.matching(hooks::HookEvent::UserPromptSubmit, "");
+        let (project_dir, session_start_context) = self
+            .sessions
+            .borrow()
+            .get(&session_id)
+            .map(|session| {
+                (
+                    session
+                        .thread
+                        .upgrade()
+                        .and_then(|thread| session_project_dir(thread.read(cx))),
+                    session.session_start_context.clone(),
+                )
+            })
+            .unwrap_or_default();
+        let runs_hooks = session_start_context.is_some() || !prompt_hooks.is_empty();
+        if runs_hooks {
+            // A cancel seen before this turn starts belongs to one that has already ended.
+            take_cancellation(&self.sessions, &session_id);
+        }
+        let executor = cx.background_executor().clone();
         cx.foreground_executor().spawn(async move {
+            let mut context = match session_start_context {
+                Some(session_start_context) => session_start_context.await,
+                None => Vec::new(),
+            };
+            let prompt_outcome = if prompt_hooks.is_empty() {
+                None
+            } else {
+                let project_dir = project_dir.context(
+                    "the session has no working directory to run UserPromptSubmit hooks in",
+                )?;
+                let outcome = hooks::submitted_prompt_outcome(
+                    prompt_hooks,
+                    &session_id.0,
+                    &project_dir,
+                    &prompt_text(&params.prompt),
+                    &executor,
+                )
+                .await;
+                Some(outcome)
+            };
+            // A cancel that came while hooks ran ends the turn before the agent sees it.
+            if runs_hooks && take_cancellation(&sessions, &session_id) {
+                return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
+            }
+            match prompt_outcome {
+                Some(PromptOutcome::Block { reason }) => return Err(anyhow!(reason)),
+                Some(PromptOutcome::Continue {
+                    context: prompt_context,
+                }) => context.extend(prompt_context),
+                None => {}
+            }
+            if let Some(session) = sessions.borrow_mut().get_mut(&session_id) {
+                session.session_start_context = None;
+            }
+            if !context.is_empty() {
+                params.prompt.insert(
+                    0,
+                    acp::ContentBlock::Text(acp::TextContent::new(context.join("\n\n"))),
+                );
+            }
+
             let result = conn.send_request(params).block_task().await;
 
             let mut suppress_abort_err = false;
@@ -8308,6 +8417,7 @@ exit 7
                 session_modes: None,
                 config_options: None,
                 default_config_task: None,
+                session_start_context: None,
                 _release_subscription: Subscription::new(|| {}),
             },
         );
@@ -8928,6 +9038,358 @@ exit 7
         let request = acp::CreateTerminalRequest::new(acp::SessionId::new("s"), "git")
             .args(vec!["status".into()]);
         assert_eq!(terminal_shell_command(&request, ShellKind::Fish), None);
+    }
+
+    /// An agent that answers `session/new` with `hooks-session`, loads any session, and records
+    /// the text blocks of each prompt it gets.
+    struct PromptRecordingAgent {
+        harness: test_support::FakeAcpConnectionHarness,
+        project: Entity<Project>,
+        prompts: Arc<Mutex<Vec<Vec<String>>>>,
+        _io_tasks: [Task<()>; 2],
+    }
+
+    impl PromptRecordingAgent {
+        async fn connect(cx: &mut gpui::TestAppContext) -> Self {
+            init_settings_test(cx);
+            let fs = fs::FakeFs::new(cx.executor());
+            fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+            let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+            let mut harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+            let prompts = Arc::new(Mutex::new(Vec::new()));
+            let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+            let agent = Agent
+                .builder()
+                .name("prompt-recording-agent")
+                .on_receive_request(
+                    async move |_request: acp::NewSessionRequest, responder, _cx| {
+                        responder.respond(acp::NewSessionResponse::new("hooks-session"))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_request: acp::LoadSessionRequest, responder, _cx| {
+                        responder.respond(acp::LoadSessionResponse::new())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    {
+                        let prompts = prompts.clone();
+                        async move |request: acp::PromptRequest, responder, _cx| {
+                            let texts = request
+                                .prompt
+                                .into_iter()
+                                .filter_map(|block| match block {
+                                    acp::ContentBlock::Text(text) => Some(text.text),
+                                    _ => None,
+                                })
+                                .collect();
+                            prompts.lock().expect("recorded prompts").push(texts);
+                            responder.respond(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_transport);
+            let agent_io_task = cx.background_spawn(async move {
+                agent.await.ok();
+            });
+            let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
+            let client = connect_client_future(
+                "prompt-recording-client",
+                client_transport,
+                harness.connection.dispatch_tx.clone(),
+                connection_tx,
+                futures::future::pending(),
+            );
+            let client_io_task = cx.background_spawn(async move {
+                client.await.ok();
+            });
+            Rc::get_mut(&mut harness.connection)
+                .expect("test harness should own the only ACP connection handle")
+                .connection = connection_rx.await.expect("receive SDK connection");
+            Self {
+                harness,
+                project,
+                prompts,
+                _io_tasks: [agent_io_task, client_io_task],
+            }
+        }
+
+        /// Opens a session in `project_dir`, which must exist on disk: hooks run there.
+        async fn new_session(
+            &self,
+            project_dir: &std::path::Path,
+            cx: &mut gpui::TestAppContext,
+        ) -> Entity<AcpThread> {
+            cx.update(|cx| {
+                self.harness.connection.clone().new_session(
+                    self.project.clone(),
+                    PathList::new(&[project_dir]),
+                    cx,
+                )
+            })
+            .await
+            .expect("new session")
+        }
+
+        #[cfg(unix)]
+        async fn load_session(
+            &self,
+            project_dir: &std::path::Path,
+            cx: &mut gpui::TestAppContext,
+        ) -> Entity<AcpThread> {
+            cx.update(|cx| {
+                self.harness.connection.clone().load_session(
+                    acp_v2::SessionId::new("hooks-session"),
+                    self.project.clone(),
+                    PathList::new(&[project_dir]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load session")
+        }
+
+        async fn prompt(
+            &self,
+            thread: &Entity<AcpThread>,
+            text: &str,
+            cx: &mut gpui::TestAppContext,
+        ) -> Result<acp::PromptResponse> {
+            let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+            cx.update(|cx| {
+                self.harness.connection.prompt(
+                    acp_v2::PromptRequest::new(session_id, vec![text.into()]),
+                    cx,
+                )
+            })
+            .await
+        }
+
+        fn prompts(&self) -> Vec<Vec<String>> {
+            self.prompts.lock().expect("recorded prompts").clone()
+        }
+    }
+
+    #[cfg(unix)]
+    fn set_test_agent_hooks(hooks: serde_json::Value, cx: &mut gpui::TestAppContext) {
+        let settings = serde_json::json!({
+            "agent_servers": {
+                "test": { "type": "custom", "command": "unused", "hooks": hooks },
+            },
+        });
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store
+                .set_user_settings(&settings.to_string(), cx)
+                .expect("hook settings");
+        });
+    }
+
+    /// One matcher group running `command`, as a hook event's settings list it.
+    #[cfg(unix)]
+    fn hook_group(matcher: &str, command: String) -> serde_json::Value {
+        serde_json::json!({
+            "matcher": matcher,
+            "hooks": [{ "type": "command", "command": command }],
+        })
+    }
+
+    #[cfg(unix)]
+    fn read_hook_input(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).expect("hook input")).expect("hook input JSON")
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn session_start_context_precedes_first_prompt_only(cx: &mut gpui::TestAppContext) {
+        let agent = PromptRecordingAgent::connect(cx).await;
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let input_path = project_dir.path().join("hook-input.json");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "SessionStart": [hook_group(
+                    "",
+                    format!("cat > '{}'; echo 'session context'", input_path.display()),
+                )],
+            }),
+            cx,
+        );
+        cx.executor().allow_parking();
+
+        let thread = agent.new_session(project_dir.path(), cx).await;
+        agent
+            .prompt(&thread, "Hello", cx)
+            .await
+            .expect("first prompt");
+        agent
+            .prompt(&thread, "Again", cx)
+            .await
+            .expect("second prompt");
+
+        assert_eq!(
+            agent.prompts(),
+            [vec!["session context", "Hello"], vec!["Again"]]
+        );
+        assert_eq!(
+            read_hook_input(&input_path),
+            serde_json::json!({
+                "session_id": "hooks-session",
+                "cwd": project_dir.path(),
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn resume_sends_source_resume(cx: &mut gpui::TestAppContext) {
+        let agent = PromptRecordingAgent::connect(cx).await;
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let input_path = project_dir.path().join("hook-input.json");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "SessionStart": [
+                    hook_group("startup", "echo 'started'".into()),
+                    hook_group(
+                        "resume",
+                        format!("cat > '{}'; echo 'resumed'", input_path.display()),
+                    ),
+                ],
+            }),
+            cx,
+        );
+        cx.executor().allow_parking();
+
+        let thread = agent.load_session(project_dir.path(), cx).await;
+        agent.prompt(&thread, "Hello", cx).await.expect("prompt");
+
+        assert_eq!(agent.prompts(), [vec!["resumed", "Hello"]]);
+        assert_eq!(read_hook_input(&input_path)["source"], "resume");
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn prompt_hook_context_precedes_user_text(cx: &mut gpui::TestAppContext) {
+        let agent = PromptRecordingAgent::connect(cx).await;
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let input_path = project_dir.path().join("hook-input.json");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "UserPromptSubmit": [hook_group(
+                    "",
+                    format!("cat > '{}'; echo 'prompt context'", input_path.display()),
+                )],
+            }),
+            cx,
+        );
+        cx.executor().allow_parking();
+
+        let thread = agent.new_session(project_dir.path(), cx).await;
+        agent.prompt(&thread, "Hello", cx).await.expect("prompt");
+
+        assert_eq!(agent.prompts(), [vec!["prompt context", "Hello"]]);
+        assert_eq!(
+            read_hook_input(&input_path),
+            serde_json::json!({
+                "session_id": "hooks-session",
+                "cwd": project_dir.path(),
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "Hello",
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn blocking_prompt_hook_sends_nothing(cx: &mut gpui::TestAppContext) {
+        let agent = PromptRecordingAgent::connect(cx).await;
+        let project_dir = tempfile::tempdir().expect("project directory");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "UserPromptSubmit": [hook_group("", "echo 'not today' >&2; exit 2".into())],
+            }),
+            cx,
+        );
+        cx.executor().allow_parking();
+
+        let thread = agent.new_session(project_dir.path(), cx).await;
+        let error = agent
+            .prompt(&thread, "Hello", cx)
+            .await
+            .expect_err("the hook blocks the prompt");
+
+        assert_eq!(error.to_string(), "not today");
+        assert!(agent.prompts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn session_start_context_outlasts_a_blocked_prompt(cx: &mut gpui::TestAppContext) {
+        let agent = PromptRecordingAgent::connect(cx).await;
+        let project_dir = tempfile::tempdir().expect("project directory");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "SessionStart": [hook_group("", "echo 'started'".into())],
+                "UserPromptSubmit": [hook_group(
+                    "",
+                    r#"if grep -q '"prompt":"First"'; then echo 'not this one' >&2; exit 2; fi"#
+                        .into(),
+                )],
+            }),
+            cx,
+        );
+        cx.executor().allow_parking();
+
+        let thread = agent.new_session(project_dir.path(), cx).await;
+        agent
+            .prompt(&thread, "First", cx)
+            .await
+            .expect_err("the hook blocks the first prompt");
+        agent.prompt(&thread, "Second", cx).await.expect("prompt");
+
+        assert_eq!(agent.prompts(), [vec!["started", "Second"]]);
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn cancel_before_the_prompt_is_sent_sends_nothing(cx: &mut gpui::TestAppContext) {
+        let agent = PromptRecordingAgent::connect(cx).await;
+        let project_dir = tempfile::tempdir().expect("project directory");
+        set_test_agent_hooks(
+            serde_json::json!({ "UserPromptSubmit": [hook_group("", "echo 'context'".into())] }),
+            cx,
+        );
+        cx.executor().allow_parking();
+
+        let thread = agent.new_session(project_dir.path(), cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let prompt = cx.update(|cx| {
+            agent.harness.connection.prompt(
+                acp_v2::PromptRequest::new(session_id.clone(), vec!["Hello".into()]),
+                cx,
+            )
+        });
+        cx.update(|cx| agent.harness.connection.cancel(&session_id, cx))
+            .expect("cancel");
+
+        let response = prompt.await.expect("cancelled prompt");
+        assert_eq!(response.stop_reason, acp::StopReason::Cancelled);
+        assert!(agent.prompts().is_empty());
+    }
+
+    #[gpui::test]
+    async fn no_hooks_sends_prompt_unchanged(cx: &mut gpui::TestAppContext) {
+        let agent = PromptRecordingAgent::connect(cx).await;
+        let project_dir = tempfile::tempdir().expect("project directory");
+
+        let thread = agent.new_session(project_dir.path(), cx).await;
+        agent.prompt(&thread, "Hello", cx).await.expect("prompt");
+
+        assert_eq!(agent.prompts(), [vec!["Hello"]]);
     }
 
     #[gpui::test]
@@ -10554,7 +11016,29 @@ fn handle_session_notification(
     }
 }
 
-/// The session's working directory as `session/new` gave it to the agent: hooks run there.
+/// Whether the session's turn was cancelled since the agent last answered; clears it.
+fn take_cancellation(
+    sessions: &RefCell<HashMap<acp_v2::SessionId, AcpSession>>,
+    session_id: &acp_v2::SessionId,
+) -> bool {
+    sessions
+        .borrow_mut()
+        .get_mut(session_id)
+        .is_some_and(|session| std::mem::take(&mut session.suppress_abort_err))
+}
+
+/// A prompt's text as `UserPromptSubmit` hooks read it: mentions and images aren't part of it.
+fn prompt_text(prompt: &[acp::ContentBlock]) -> String {
+    prompt
+        .iter()
+        .filter_map(|block| match block {
+            acp::ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first of the working directories the session was opened with: hooks run there.
 fn session_project_dir(thread: &AcpThread) -> Option<PathBuf> {
     thread.work_dirs()?.ordered_paths().next().cloned()
 }

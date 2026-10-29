@@ -1,7 +1,7 @@
 mod decision;
 mod runner;
 
-pub use decision::ToolDecision;
+pub use decision::{PromptOutcome, ToolDecision};
 
 use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 
@@ -276,6 +276,51 @@ pub async fn shell_command_decision(
     fields.insert("tool_input".into(), json!({ "command": command_line }));
     let input = hook_input(HookEvent::PreToolUse, session_id, cwd, fields);
     decision::tool_decision(&runner::run_hooks(commands, &input, project_dir, executor).await)
+}
+
+/// How a session came to be opened, as `SessionStart` hooks are told it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionSource {
+    Startup,
+    Resume,
+}
+
+impl SessionSource {
+    /// The `source` Claude Code sends, which `SessionStart` matchers match.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Resume => "resume",
+        }
+    }
+}
+
+/// Runs `SessionStart` hooks in `project_dir` and returns the context they add.
+pub async fn session_start_context(
+    commands: Vec<HookCommand>,
+    session_id: &str,
+    project_dir: &Path,
+    source: SessionSource,
+    executor: &BackgroundExecutor,
+) -> Vec<String> {
+    let mut fields = Map::new();
+    fields.insert("source".into(), source.name().into());
+    let input = hook_input(HookEvent::SessionStart, session_id, project_dir, fields);
+    decision::session_context(&runner::run_hooks(commands, &input, project_dir, executor).await)
+}
+
+/// Runs `UserPromptSubmit` hooks in `project_dir` on the text of the prompt the user sent.
+pub async fn submitted_prompt_outcome(
+    commands: Vec<HookCommand>,
+    session_id: &str,
+    project_dir: &Path,
+    prompt: &str,
+    executor: &BackgroundExecutor,
+) -> PromptOutcome {
+    let mut fields = Map::new();
+    fields.insert("prompt".into(), prompt.into());
+    let input = hook_input(HookEvent::UserPromptSubmit, session_id, project_dir, fields);
+    decision::prompt_outcome(&runner::run_hooks(commands, &input, project_dir, executor).await)
 }
 
 /// The JSON a hook reads on stdin: `fields` plus Claude Code's common `session_id`, `cwd` and
