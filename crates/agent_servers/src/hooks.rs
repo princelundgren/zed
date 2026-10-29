@@ -57,7 +57,7 @@ impl HookEvent {
 /// One `command` hook, ready to run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HookCommand {
-    /// The shell command, run with `sh -c`.
+    /// The shell command, run with `/bin/sh -c`.
     pub command: String,
     pub timeout: Duration,
     /// Whether a failure or timeout blocks the action, as exit 2 does (`onFailure: "block"`).

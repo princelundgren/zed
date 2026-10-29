@@ -57,7 +57,7 @@ async fn run_hook(
     cwd: &Path,
     executor: &BackgroundExecutor,
 ) -> HookRun {
-    let mut child = match new_command("sh")
+    let mut child = match new_command("/bin/sh")
         .arg("-c")
         .arg(&command.command)
         .current_dir(cwd)
@@ -98,7 +98,7 @@ async fn run_hook(
     }
 }
 
-// These run real processes through the host's `sh`, so they need a Unix-like shell.
+// These run real processes through `/bin/sh`, so they need a Unix-like system.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
