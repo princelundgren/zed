@@ -29,6 +29,17 @@ pub struct Terminals {
     pub(crate) local_handles: Vec<WeakEntity<terminal::Terminal>>,
 }
 
+/// Which settings shape how a task terminal starts its command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalStartup {
+    /// The terminal settings of the project the terminal opens in apply, including its `env`,
+    /// and a detected Python environment is activated first.
+    ProjectSettings,
+    /// Only the user's terminal settings apply and no Python environment is activated; the
+    /// directory's shell environment (direnv, mise) still applies.
+    UserSettingsOnly,
+}
+
 impl Project {
     pub fn active_entry_directory(&self, cx: &App) -> Option<PathBuf> {
         let entry_id = self.active_entry()?;
@@ -67,6 +78,16 @@ impl Project {
         spawn_task: SpawnInTerminal,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_task_with_startup(spawn_task, TerminalStartup::ProjectSettings, cx)
+    }
+
+    /// Creates a terminal running `spawn_task`, with `startup` choosing which settings shape it.
+    pub fn create_terminal_task_with_startup(
+        &mut self,
+        spawn_task: SpawnInTerminal,
+        startup: TerminalStartup,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
         let is_via_remote = self.remote_client.is_some();
 
         let path: Option<Arc<Path>> = if let Some(cwd) = &spawn_task.cwd {
@@ -83,6 +104,7 @@ impl Project {
 
         let mut settings_location = None;
         if let Some(path) = path.as_ref()
+            && startup == TerminalStartup::ProjectSettings
             && let Some((worktree, _)) = self.find_worktree(path, cx)
         {
             settings_location = Some(SettingsLocation {
@@ -91,7 +113,8 @@ impl Project {
             });
         }
         let settings = TerminalSettings::get(settings_location, cx).clone();
-        let detect_venv = settings.detect_venv.as_option().is_some();
+        let detect_venv = startup == TerminalStartup::ProjectSettings
+            && settings.detect_venv.as_option().is_some();
 
         let terminal_mode = TerminalMode::task(spawn_task.clone());
 

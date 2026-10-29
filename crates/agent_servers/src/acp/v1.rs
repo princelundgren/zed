@@ -30,6 +30,7 @@ use futures::{Future, FutureExt as _};
 use project::agent_server_store::{
     AgentServerCommand, AgentServerStore, AllAgentServersSettings, CustomAgentServerSettings,
 };
+use project::terminals::TerminalStartup;
 use project::{AgentId, Project};
 use serde::Deserialize;
 use settings::{AgentConfigOptionValue, SettingsStore};
@@ -11790,6 +11791,12 @@ fn handle_create_terminal(
         Err(e) => return respond_err(responder, e),
     };
     let hook_commands = ctx.hooks.matching(hooks::HookEvent::PreToolUse, "Bash");
+    // A hooked terminal skips project terminal settings and virtualenv activation.
+    let startup = if hook_commands.is_empty() {
+        TerminalStartup::ProjectSettings
+    } else {
+        TerminalStartup::UserSettingsOnly
+    };
 
     cx.spawn(async move |cx| {
         let result: Result<_, acp::Error> = async {
@@ -11862,6 +11869,7 @@ fn handle_create_terminal(
                 terminal_cwd.clone(),
                 &shell,
                 is_windows,
+                startup,
                 &project,
                 cx,
             )

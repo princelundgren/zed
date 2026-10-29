@@ -6,7 +6,7 @@ use gpui::{App, AppContext, AsyncApp, Context, Entity, Task};
 use http_proxy::Allowlist;
 use language::LanguageRegistry;
 use markdown::Markdown;
-use project::Project;
+use project::{Project, terminals::TerminalStartup};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap as StdHashMap,
@@ -928,6 +928,9 @@ impl Terminal {
     }
 }
 
+/// Starts `command` with `args` in a terminal through `shell`. With
+/// [`TerminalStartup::UserSettingsOnly`] the shell is also non-interactive, so it reads no
+/// interactive startup file (`$ENV`, `.bashrc`, `.zshrc`) before the command.
 pub async fn create_terminal_entity(
     command: String,
     args: &[String],
@@ -935,6 +938,7 @@ pub async fn create_terminal_entity(
     cwd: Option<PathBuf>,
     shell: &Shell,
     is_windows: bool,
+    startup: TerminalStartup,
     project: &Entity<Project>,
     cx: &mut AsyncApp,
 ) -> Result<Entity<terminal::Terminal>> {
@@ -954,13 +958,15 @@ pub async fn create_terminal_entity(
     disable_pagers_through_env(&mut env);
     env.extend(env_vars);
 
-    let (task_command, task_args) = task::ShellBuilder::new(shell, is_windows)
-        .redirect_stdin_to_dev_null()
-        .build(Some(command.clone()), &args);
+    let mut shell_builder = task::ShellBuilder::new(shell, is_windows).redirect_stdin_to_dev_null();
+    if startup == TerminalStartup::UserSettingsOnly {
+        shell_builder = shell_builder.non_interactive();
+    }
+    let (task_command, task_args) = shell_builder.build(Some(command.clone()), &args);
 
     project
         .update(cx, |project, cx| {
-            project.create_terminal_task(
+            project.create_terminal_task_with_startup(
                 task::SpawnInTerminal {
                     command: Some(task_command),
                     args: task_args,
@@ -968,6 +974,7 @@ pub async fn create_terminal_entity(
                     env,
                     ..Default::default()
                 },
+                startup,
                 cx,
             )
         })
