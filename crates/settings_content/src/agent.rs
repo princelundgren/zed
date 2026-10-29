@@ -871,6 +871,13 @@ pub enum CustomAgentServerSettings {
         /// Default: {}
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         favorite_config_option_values: HashMap<String, Vec<String>>,
+        /// Hooks for this agent, in Claude Code's `hooks` format: a map from event name
+        /// (`PreToolUse`, `UserPromptSubmit`, `SessionStart`, `Stop`) to matcher groups.
+        /// Ignored in project settings; other events and hook types are skipped.
+        ///
+        /// Default: {}
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        hooks: AgentHooksContent,
     },
     // Used for the ACP extension migration
     #[serde(alias = "extension")]
@@ -900,7 +907,60 @@ pub enum CustomAgentServerSettings {
         /// Default: {}
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         favorite_config_option_values: HashMap<String, Vec<String>>,
+        /// Hooks for this agent, in Claude Code's `hooks` format: a map from event name
+        /// (`PreToolUse`, `UserPromptSubmit`, `SessionStart`, `Stop`) to matcher groups.
+        /// Ignored in project settings; other events and hook types are skipped.
+        ///
+        /// Default: {}
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        hooks: AgentHooksContent,
     },
+}
+
+/// Hooks for one agent, keyed by event name.
+pub type AgentHooksContent = HashMap<String, Vec<AgentHookMatcherGroupContent>>;
+
+/// A group of hooks that run when its matcher matches the event's subject.
+#[with_fallible_options]
+#[derive(Deserialize, Serialize, Clone, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct AgentHookMatcherGroupContent {
+    /// The tool name (`PreToolUse`) or session source (`SessionStart`) this group applies to.
+    /// `*`, empty or absent matches all. Only letters, digits, `_`, `-`, spaces, `,` and `|`
+    /// is an exact name or a list split on `|` or `,`. Anything else is an unanchored regular
+    /// expression.
+    pub matcher: Option<String>,
+    /// The hooks to run when the matcher matches.
+    #[serde(default)]
+    pub hooks: Vec<AgentHookContent>,
+}
+
+/// One hook. Only `command` hooks in shell form are used.
+#[with_fallible_options]
+#[derive(Deserialize, Serialize, Clone, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct AgentHookContent {
+    /// The hook type; only `command` is used.
+    #[serde(rename = "type")]
+    pub hook_type: String,
+    /// The shell command to run.
+    pub command: Option<String>,
+    /// Seconds before the command is killed.
+    ///
+    /// Default: 600, or 30 for `UserPromptSubmit`
+    pub timeout: Option<u64>,
+    /// Exec-form arguments. Not supported: a hook that sets them is skipped.
+    pub args: Option<Vec<String>>,
+    /// A permission-rule condition narrowing when the hook runs. Not supported: a hook that
+    /// sets it is skipped.
+    #[serde(rename = "if")]
+    pub condition: Option<String>,
+    /// The shell to run the command in. Not supported: a hook that sets it is skipped.
+    pub shell: Option<String>,
+    /// Whether the hook runs in the background. Not supported: a hook that sets it is skipped.
+    #[serde(rename = "async")]
+    pub run_async: Option<bool>,
+    /// `block` makes a failed or timed-out hook block the action.
+    #[serde(rename = "onFailure")]
+    pub on_failure: Option<String>,
 }
 
 /// A persisted sandbox writable-path grant. Deserializes from either a bare
@@ -1156,6 +1216,54 @@ impl std::fmt::Display for ToolPermissionMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_hooks_accept_a_claude_code_hooks_block() {
+        let settings: CustomAgentServerSettings = serde_json::from_value(serde_json::json!({
+            "type": "custom",
+            "command": "agent",
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{ "type": "command", "command": "guard.sh", "timeout": 5 }]
+                }],
+                "PostToolUse": [{ "hooks": [{ "type": "http", "url": "http://localhost" }] }]
+            }
+        }))
+        .expect("deserialize agent with hooks");
+
+        let CustomAgentServerSettings::Custom { hooks, .. } = settings else {
+            panic!("expected a custom agent");
+        };
+        assert_eq!(
+            hooks["PreToolUse"],
+            vec![AgentHookMatcherGroupContent {
+                matcher: Some("Bash".to_string()),
+                hooks: vec![AgentHookContent {
+                    hook_type: "command".to_string(),
+                    command: Some("guard.sh".to_string()),
+                    timeout: Some(5),
+                    args: None,
+                    condition: None,
+                    shell: None,
+                    run_async: None,
+                    on_failure: None,
+                }],
+            }]
+        );
+        assert_eq!(hooks["PostToolUse"][0].hooks[0].hook_type, "http");
+    }
+
+    #[test]
+    fn agent_without_hooks_serializes_without_the_key() {
+        let settings: CustomAgentServerSettings =
+            serde_json::from_value(serde_json::json!({ "type": "registry" }))
+                .expect("deserialize registry agent");
+
+        let serialized = serde_json::to_value(&settings).expect("serialize registry agent");
+
+        assert_eq!(serialized.get("hooks"), None);
+    }
 
     #[test]
     fn agent_config_option_value_serializes_value_id_as_string() {

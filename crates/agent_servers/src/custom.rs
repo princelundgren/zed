@@ -332,6 +332,7 @@ fn default_settings_for_agent() -> settings::CustomAgentServerSettings {
         env: Default::default(),
         default_config_options: Default::default(),
         favorite_config_option_values: Default::default(),
+        hooks: Default::default(),
     }
 }
 
@@ -339,7 +340,7 @@ fn default_settings_for_agent() -> settings::CustomAgentServerSettings {
 mod tests {
     use super::*;
     use collections::HashMap;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, UpdateGlobal as _};
     use project::agent_registry_store::{
         AgentRegistryStore, RegistryAgent, RegistryAgentMetadata, RegistryNpxAgent,
     };
@@ -398,6 +399,68 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_project_settings_cannot_add_agent_hooks(cx: &mut TestAppContext) {
+        fn agent_with_stop_hook(command: &str) -> String {
+            serde_json::json!({
+                "agent_servers": {
+                    "my-agent": {
+                        "type": "custom",
+                        "command": "my-agent-cli",
+                        "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": command }] }] }
+                    }
+                }
+            })
+            .to_string()
+        }
+        init_test(cx);
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(&agent_with_stop_hook("user-hook"), cx)
+                    .unwrap();
+                store
+                    .set_local_settings(
+                        settings::WorktreeId::from_usize(1),
+                        settings::LocalSettingsPath::InWorktree(
+                            util::rel_path::RelPath::empty_arc(),
+                        ),
+                        settings::LocalSettingsKind::Settings,
+                        Some(&agent_with_stop_hook("project-hook")),
+                        cx,
+                    )
+                    .unwrap();
+            });
+        });
+
+        let loaded_project_files = cx.read_global(|store: &SettingsStore, _| {
+            store
+                .local_settings(settings::WorktreeId::from_usize(1))
+                .count()
+        });
+        assert_eq!(
+            loaded_project_files, 1,
+            "the project settings file must load"
+        );
+
+        let worktree_location = settings::SettingsLocation {
+            worktree_id: settings::WorktreeId::from_usize(1),
+            path: util::rel_path::RelPath::empty(),
+        };
+        cx.update(|cx| {
+            for location in [None, Some(worktree_location)] {
+                let commands: Vec<_> = AllAgentServersSettings::get(location, cx)["my-agent"]
+                    .hooks()["Stop"]
+                    .iter()
+                    .flat_map(|group| &group.hooks)
+                    .filter_map(|hook| hook.command.clone())
+                    .collect();
+                assert_eq!(commands, vec!["user-hook".to_string()]);
+            }
+        });
+    }
+
+    #[gpui::test]
     fn test_unknown_agent_is_not_registry(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
@@ -427,6 +490,7 @@ mod tests {
                     default_mode: None,
                     default_config_options: HashMap::default(),
                     favorite_config_option_values: HashMap::default(),
+                    hooks: HashMap::default(),
                 },
             )],
         );

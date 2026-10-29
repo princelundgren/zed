@@ -236,6 +236,7 @@ impl AgentServerStore {
                     env: Default::default(),
                     default_config_options: HashMap::default(),
                     favorite_config_option_values: HashMap::default(),
+                    hooks: HashMap::default(),
                 }),
             );
         });
@@ -1645,6 +1646,10 @@ pub enum CustomAgentServerSettings {
         ///
         /// Default: {}
         favorite_config_option_values: HashMap<String, Vec<String>>,
+        /// Hooks for this agent, by event name.
+        ///
+        /// Default: {}
+        hooks: settings::AgentHooksContent,
     },
     Registry {
         /// Additional environment variables to pass to the agent.
@@ -1669,6 +1674,10 @@ pub enum CustomAgentServerSettings {
         ///
         /// Default: {}
         favorite_config_option_values: HashMap<String, Vec<String>>,
+        /// Hooks for this agent, by event name.
+        ///
+        /// Default: {}
+        hooks: settings::AgentHooksContent,
     },
 }
 
@@ -1700,6 +1709,13 @@ impl CustomAgentServerSettings {
         }
     }
 
+    pub fn hooks(&self) -> &settings::AgentHooksContent {
+        match self {
+            CustomAgentServerSettings::Custom { hooks, .. }
+            | CustomAgentServerSettings::Registry { hooks, .. } => hooks,
+        }
+    }
+
     pub fn favorite_config_option_values(&self, config_id: &str) -> Option<&[String]> {
         match self {
             CustomAgentServerSettings::Custom {
@@ -1726,6 +1742,7 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
                 default_mode,
                 default_config_options,
                 favorite_config_option_values,
+                hooks,
             } => CustomAgentServerSettings::Custom {
                 command: AgentServerCommand {
                     path: PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).as_ref()),
@@ -1735,17 +1752,20 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
                 default_mode,
                 default_config_options,
                 favorite_config_option_values,
+                hooks,
             },
             settings::CustomAgentServerSettings::Registry {
                 env,
                 default_mode,
                 default_config_options,
                 favorite_config_option_values,
+                hooks,
             } => CustomAgentServerSettings::Registry {
                 env,
                 default_mode,
                 default_config_options,
                 favorite_config_option_values,
+                hooks,
             },
         }
     }
@@ -1896,6 +1916,7 @@ mod tests {
                                     default_mode: None,
                                     default_config_options: HashMap::default(),
                                     favorite_config_option_values: HashMap::default(),
+                                    hooks: HashMap::default(),
                                 }
                                 .into(),
                             )

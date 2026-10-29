@@ -5719,6 +5719,7 @@ mod tests {
                         default_mode: None,
                         default_config_options: HashMap::default(),
                         favorite_config_option_values: HashMap::default(),
+                        hooks: HashMap::default(),
                     }
                     .into(),
                 )])),
@@ -6358,6 +6359,7 @@ mod tests {
                             AgentConfigOptionValue::from("config-value"),
                         )]),
                         favorite_config_option_values: HashMap::default(),
+                        hooks: HashMap::default(),
                     }
                     .into(),
                 )])),

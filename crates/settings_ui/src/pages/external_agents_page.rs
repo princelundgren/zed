@@ -10,7 +10,8 @@ use gpui::{
 use itertools::Itertools as _;
 use project::agent_server_store::{AgentId, AgentServerStore, ExternalAgentSource};
 use settings::{
-    AgentConfigOptionValue, CustomAgentServerSettings, SettingsStore, update_settings_file,
+    AgentConfigOptionValue, AgentHooksContent, CustomAgentServerSettings, SettingsStore,
+    update_settings_file,
 };
 use ui::{
     AiSettingItem, AiSettingItemSource, AiSettingItemStatus, ContextMenu, ContextMenuEntry,
@@ -338,6 +339,7 @@ pub(crate) struct CustomAgentForm {
     default_mode: Option<String>,
     default_config_options: HashMap<String, AgentConfigOptionValue>,
     favorite_config_option_values: HashMap<String, Vec<String>>,
+    hooks: AgentHooksContent,
     /// Stable handles for the Cancel/Save buttons so they can render a focus
     /// ring. `Filled`/`Subtle` buttons only get a subtle `focus_visible`
     /// background change otherwise, which is hard to see.
@@ -361,6 +363,7 @@ impl CustomAgentForm {
         let mut default_mode = None;
         let mut default_config_options = HashMap::default();
         let mut favorite_config_option_values = HashMap::default();
+        let mut hooks = AgentHooksContent::default();
 
         // Pre-fill from the raw settings so invalid values typed directly into
         // settings.json still load into the form for correction.
@@ -373,6 +376,7 @@ impl CustomAgentForm {
                     default_mode: mode,
                     default_config_options: config_options,
                     favorite_config_option_values: favorites,
+                    hooks: agent_hooks,
                 } => {
                     command_initial = Some(path.to_string_lossy().to_string());
                     if !args.is_empty() {
@@ -384,12 +388,14 @@ impl CustomAgentForm {
                     default_mode = mode.clone();
                     default_config_options = config_options.clone();
                     favorite_config_option_values = favorites.clone();
+                    hooks = agent_hooks.clone();
                 }
                 CustomAgentServerSettings::Registry {
                     env: env_map,
                     default_mode: mode,
                     default_config_options: config_options,
                     favorite_config_option_values: favorites,
+                    hooks: agent_hooks,
                 } => {
                     for (key, value) in sorted_pairs(env_map) {
                         env.push(new_kv_row(Some(&key), Some(&value), window, cx));
@@ -397,6 +403,7 @@ impl CustomAgentForm {
                     default_mode = mode.clone();
                     default_config_options = config_options.clone();
                     favorite_config_option_values = favorites.clone();
+                    hooks = agent_hooks.clone();
                 }
             }
         }
@@ -410,6 +417,7 @@ impl CustomAgentForm {
             default_mode,
             default_config_options,
             favorite_config_option_values,
+            hooks,
             cancel_focus_handle: cx.focus_handle(),
             save_focus_handle: cx.focus_handle(),
             error: None,
@@ -784,6 +792,7 @@ struct CustomAgentFormValues {
     default_mode: Option<String>,
     default_config_options: HashMap<String, AgentConfigOptionValue>,
     favorite_config_option_values: HashMap<String, Vec<String>>,
+    hooks: AgentHooksContent,
 }
 
 fn build_settings_from_form(
@@ -799,6 +808,7 @@ fn build_settings_from_form(
         default_mode: form.default_mode.clone(),
         default_config_options: form.default_config_options.clone(),
         favorite_config_option_values: form.favorite_config_option_values.clone(),
+        hooks: form.hooks.clone(),
     };
     build_settings_from_values(values)
 }
@@ -836,6 +846,7 @@ fn build_settings_from_values(
         default_mode: values.default_mode,
         default_config_options: values.default_config_options,
         favorite_config_option_values: values.favorite_config_option_values,
+        hooks: values.hooks,
     };
 
     Ok((AgentId(name.into()), values.original_id, content))
@@ -948,6 +959,7 @@ async fn add_custom_agent_settings_entry(
                                 default_mode: None,
                                 default_config_options: Default::default(),
                                 favorite_config_option_values: Default::default(),
+                                hooks: Default::default(),
                             },
                         );
                     }
@@ -1045,6 +1057,7 @@ mod tests {
             default_mode: None,
             default_config_options: HashMap::default(),
             favorite_config_option_values: HashMap::default(),
+            hooks: HashMap::default(),
         }
     }
 
@@ -1112,6 +1125,7 @@ mod tests {
                 default_mode: None,
                 default_config_options: HashMap::default(),
                 favorite_config_option_values: HashMap::default(),
+                hooks: HashMap::default(),
             }
         );
     }
@@ -1138,6 +1152,23 @@ mod tests {
                     Some("val"),
                 );
             }
+            _ => panic!("expected a custom agent"),
+        }
+    }
+
+    #[test]
+    fn preserves_hooks() {
+        let mut values = values();
+        let hooks: AgentHooksContent = serde_json::from_value(serde_json::json!({
+            "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "guard.sh" }] }]
+        }))
+        .unwrap();
+        values.hooks = hooks.clone();
+
+        let (_, _, content) = build_settings_from_values(values).unwrap();
+
+        match content {
+            CustomAgentServerSettings::Custom { hooks: built, .. } => assert_eq!(built, hooks),
             _ => panic!("expected a custom agent"),
         }
     }
