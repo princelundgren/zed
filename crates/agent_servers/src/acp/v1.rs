@@ -11296,7 +11296,7 @@ fn handle_create_terminal(
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) {
-    let session_id = acp_v2::SessionId::new(args.session_id.0);
+    let session_id = acp_v2::SessionId::new(args.session_id.0.clone());
     let thread = match session_thread(ctx, &session_id) {
         Ok(t) => t,
         Err(e) => return respond_err(responder, e),
