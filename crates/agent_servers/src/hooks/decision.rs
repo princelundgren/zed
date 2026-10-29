@@ -287,7 +287,10 @@ mod tests {
         let allow = permission("allow", "fine");
         let ask = permission("ask", "check");
         let deny = permission("deny", "no force-push");
-        assert_eq!(tool_decision(&[allow.clone()]), ToolDecision::Allow);
+        assert_eq!(
+            tool_decision(std::slice::from_ref(&allow)),
+            ToolDecision::Allow
+        );
         assert_eq!(
             tool_decision(&[allow.clone(), ask.clone()]),
             ToolDecision::Ask
