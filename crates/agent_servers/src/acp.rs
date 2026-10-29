@@ -498,6 +498,9 @@ pub struct AcpSession {
     default_config_task: Option<Task<()>>,
     /// What the session's `SessionStart` hooks add, sent ahead of its first prompt.
     session_start_context: Option<Shared<Task<Vec<String>>>>,
+    /// The thread's first working directory, where hooks run. Copied so a prompt can find it
+    /// while the thread is being updated.
+    project_dir: Option<PathBuf>,
     _release_subscription: Subscription,
 }
 
@@ -874,6 +877,7 @@ fn apply_subagent_update(
             config_options: Some(ConfigOptions::new(Rc::new(RefCell::new(Vec::new())))),
             default_config_task: None,
             session_start_context: None,
+            project_dir: None,
             _release_subscription: release_subscription,
         },
     );

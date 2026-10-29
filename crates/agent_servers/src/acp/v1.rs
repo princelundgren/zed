@@ -844,6 +844,7 @@ impl AcpConnection {
                 config_options,
                 default_config_task,
                 session_start_context: None,
+                project_dir: session_project_dir(thread.read(cx)),
                 _release_subscription: release_subscription,
             },
         );
@@ -1722,10 +1723,7 @@ impl AgentConnection for AcpConnection {
             .get(&session_id)
             .map(|session| {
                 (
-                    session
-                        .thread
-                        .upgrade()
-                        .and_then(|thread| session_project_dir(thread.read(cx))),
+                    session.project_dir.clone(),
                     session.session_start_context.clone(),
                 )
             })
@@ -8415,6 +8413,7 @@ exit 7
                 config_options: None,
                 default_config_task: None,
                 session_start_context: None,
+                project_dir: None,
                 _release_subscription: Subscription::new(|| {}),
             },
         );
