@@ -39,6 +39,8 @@ use thiserror::Error;
 use util::ResultExt as _;
 use util::path_list::PathList;
 
+use crate::hooks::LiveAgentHooks;
+
 const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn mcp_configurations_for_project(
@@ -252,6 +254,7 @@ struct ClientContext {
     /// A v1 agent may only send `subagent_update` after Zed advertises the `subagents`
     /// client capability. v2 includes subagents in every session.
     accepts_subagent_updates: bool,
+    hooks: LiveAgentHooks,
 }
 
 fn dispatch_queue_closed_error() -> acp::Error {

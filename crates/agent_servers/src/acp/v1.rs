@@ -40,6 +40,7 @@ use std::{any::Any, cell::RefCell};
 use task::SpawnInTerminal;
 use util::ResultExt as _;
 use util::path_list::PathList;
+use util::shell::ShellKind;
 
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task, WeakEntity};
@@ -48,6 +49,7 @@ use acp_thread::{AcpThread, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
+use crate::hooks::{self, LiveAgentHooks, ToolDecision};
 use crate::{CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
@@ -88,6 +90,7 @@ pub struct AcpConnection {
     session_list: Option<Rc<AcpSessionList>>,
     debug_log: AcpDebugLog,
     _settings_subscription: Subscription,
+    _hooks_subscription: Subscription,
     _runtime: runtime::ClientRuntime,
     dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
     _wait_task: Task<()>,
@@ -572,6 +575,8 @@ impl AcpConnection {
         let client_capabilities = client_capabilities_for_agent(&agent_id, offer_subagents);
 
         let accepts_subagent_updates = client_capabilities.subagents.is_some();
+        let hooks = LiveAgentHooks::default();
+        let hooks_subscription = cx.update(|cx| hooks.observe_settings(agent_id.clone(), cx));
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
@@ -579,6 +584,7 @@ impl AcpConnection {
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates,
+            hooks: hooks.clone(),
         };
         let (mut runtime, shutdown) = runtime::ClientRuntime::new(dispatch_context, cx);
         let dispatch_tx = runtime.sender();
@@ -735,6 +741,7 @@ impl AcpConnection {
             session_list,
             debug_log,
             _settings_subscription: settings_subscription,
+            _hooks_subscription: hooks_subscription,
             _runtime: runtime,
             dispatch_tx,
             _wait_task: wait_task,
@@ -760,11 +767,13 @@ impl AcpConnection {
         io_task: Task<()>,
         dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
         dispatch_task: Task<()>,
+        hooks: LiveAgentHooks,
         cx: &mut App,
     ) -> Self {
         let agent_id = AgentId::new("test");
         let defaults = AcpConnectionDefaults::default();
         let settings_subscription = defaults.observe_settings(agent_id.clone(), cx);
+        let hooks_subscription = hooks.observe_settings(agent_id.clone(), cx);
 
         Self {
             id: agent_id,
@@ -783,6 +792,7 @@ impl AcpConnection {
             session_list: None,
             debug_log: AcpDebugLog::default(),
             _settings_subscription: settings_subscription,
+            _hooks_subscription: hooks_subscription,
             _runtime: runtime::ClientRuntime::from_test_tasks(
                 dispatch_tx.clone(),
                 io_task,
@@ -2266,6 +2276,7 @@ pub mod test_support {
         let auth_methods = acp_thread::auth_methods::from_v1(response.auth_methods)?;
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let hooks = LiveAgentHooks::default();
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
@@ -2273,6 +2284,7 @@ pub mod test_support {
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates: false,
+            hooks: hooks.clone(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -2297,6 +2309,7 @@ pub mod test_support {
                 client_io_task,
                 dispatch_tx,
                 dispatch_task,
+                hooks,
                 cx,
             )
         });
@@ -7019,6 +7032,7 @@ mod tests {
                 client_io_task,
                 mpsc::unbounded().0,
                 Task::ready(()),
+                LiveAgentHooks::default(),
                 cx,
             )
         });
@@ -7753,6 +7767,7 @@ exit 7
         let agent_capabilities = response.agent_capabilities;
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let hooks = LiveAgentHooks::default();
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
@@ -7760,6 +7775,7 @@ exit 7
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates,
+            hooks: hooks.clone(),
         };
         // `TestAppContext::spawn` hands out an `AsyncApp` by value, whereas the
         // production path uses `Context::spawn` which hands out `&mut AsyncApp`.
@@ -7789,6 +7805,7 @@ exit 7
                 client_io_task,
                 dispatch_tx,
                 dispatch_task,
+                hooks,
                 cx,
             )
         });
@@ -8145,6 +8162,7 @@ exit 7
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates: false,
+            hooks: LiveAgentHooks::default(),
         };
         let (dispatch_tx, mut dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
         let dispatch_task = cx.spawn(move |mut cx| async move {
@@ -8300,6 +8318,7 @@ exit 7
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates,
+            hooks: LiveAgentHooks::default(),
         };
         let parent_id = parent_session_id.0.to_string();
 
@@ -8480,6 +8499,7 @@ exit 7
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates: false,
+            hooks: LiveAgentHooks::default(),
         };
         let (sender, mut receiver) = mpsc::unbounded::<ForegroundWork>();
         let cleanup = settle_after_disconnect(sender.clone()).boxed().shared();
@@ -8770,6 +8790,144 @@ exit 7
         barrier_received
             .await
             .expect("foreground dispatch after EOF");
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn pre_tool_use_hook_added_in_settings_denies_a_terminal(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        // Hooks run as real processes in the session's directory, so it must exist on disk.
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let _thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("hooks-session"),
+                    project,
+                    PathList::new(&[project_dir.path()]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load hooks session");
+
+        let hook_input_path = project_dir.path().join("hook-input.json");
+        let settings = serde_json::json!({
+            "agent_servers": {
+                "test": {
+                    "type": "custom",
+                    "command": "unused",
+                    "hooks": {
+                        "PreToolUse": [{
+                            "matcher": "Bash",
+                            "hooks": [{
+                                "type": "command",
+                                "command": format!(
+                                    "cat > '{}'; echo 'no force pushes' >&2; exit 2",
+                                    hook_input_path.display()
+                                ),
+                            }],
+                        }],
+                    },
+                },
+            },
+        });
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store
+                .set_user_settings(&settings.to_string(), cx)
+                .expect("hook settings");
+        });
+        cx.executor().allow_parking();
+
+        let error = agent
+            .send_request(
+                acp::CreateTerminalRequest::new(acp::SessionId::new("hooks-session"), "git")
+                    .args(vec!["push".into(), "--force".into(), "origin main".into()])
+                    .env(vec![acp::EnvVariable::new("GIT_TRACE", "1 2")])
+                    .cwd(PathBuf::from("/srv/other")),
+            )
+            .block_task()
+            .await
+            .expect_err("the hook denies the command");
+
+        assert_eq!(error.data, Some(serde_json::json!("no force pushes")));
+        let hook_input: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&hook_input_path).expect("hook input"))
+                .expect("hook input JSON");
+        assert_eq!(
+            hook_input,
+            serde_json::json!({
+                "session_id": "hooks-session",
+                "cwd": "/srv/other",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": "export GIT_TRACE='1 2'; git push --force 'origin main'"
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_terminal_without_args_reaches_hooks_as_its_shell_text() {
+        let request =
+            acp::CreateTerminalRequest::new(acp::SessionId::new("s"), "git push --force; rm -rf .");
+        assert_eq!(
+            terminal_shell_command(&request, ShellKind::Posix).as_deref(),
+            Some("git push --force; rm -rf .")
+        );
+    }
+
+    #[test]
+    fn an_env_name_that_is_not_an_identifier_has_no_shell_text() {
+        let request = acp::CreateTerminalRequest::new(acp::SessionId::new("s"), "true")
+            .env(vec![acp::EnvVariable::new("A=1 rm -rf . #", "x")]);
+        assert_eq!(terminal_shell_command(&request, ShellKind::Posix), None);
+    }
+
+    #[cfg(unix)]
+    async fn run_in_sh(shell_text: &str) -> String {
+        let output = util::command::new_command("sh")
+            .arg("-c")
+            .arg(shell_text)
+            .output()
+            .await
+            .expect("sh runs the shell text");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).expect("UTF-8 output")
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn shell_text_passes_each_arg_as_given(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let request = acp::CreateTerminalRequest::new(acp::SessionId::new("s"), "printf")
+            .args(vec!["%s|%s".into(), "a b".into(), "it's $HOME".into()]);
+        let shell_text = terminal_shell_command(&request, ShellKind::Posix).expect("shell text");
+        assert_eq!(run_in_sh(&shell_text).await, "a b|it's $HOME");
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn shell_text_env_reaches_every_command(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let request = acp::CreateTerminalRequest::new(
+            acp::SessionId::new("s"),
+            r#"true && printf %s "$GREETING""#,
+        )
+        .env(vec![acp::EnvVariable::new("GREETING", "1 2")]);
+        let shell_text = terminal_shell_command(&request, ShellKind::Posix).expect("shell text");
+        assert_eq!(run_in_sh(&shell_text).await, "1 2");
+    }
+
+    #[test]
+    fn a_terminal_in_another_shell_has_no_shell_text() {
+        let request = acp::CreateTerminalRequest::new(acp::SessionId::new("s"), "git")
+            .args(vec!["status".into()]);
+        assert_eq!(terminal_shell_command(&request, ShellKind::Fish), None);
     }
 
     #[gpui::test]
@@ -10396,34 +10554,148 @@ fn handle_session_notification(
     }
 }
 
+/// The session's working directory as `session/new` gave it to the agent: hooks run there.
+fn session_project_dir(thread: &AcpThread) -> Option<PathBuf> {
+    thread.work_dirs()?.ordered_paths().next().cloned()
+}
+
+/// A `terminal/create` request as POSIX shell text, which its hooks read and, once they let it
+/// through, the terminal runs: an `export` of its env, then the command and its quoted args, or
+/// the command alone as the shell text it is. `None` when `shell` isn't POSIX, an env name isn't
+/// an identifier, or a word holds a NUL byte.
+fn terminal_shell_command(args: &acp::CreateTerminalRequest, shell: ShellKind) -> Option<String> {
+    if shell != ShellKind::Posix {
+        return None;
+    }
+    let mut exports = Vec::new();
+    for variable in &args.env {
+        if !is_shell_identifier(&variable.name) {
+            return None;
+        }
+        exports.push(format!(
+            "{}={}",
+            variable.name,
+            shell.try_quote(&variable.value)?
+        ));
+    }
+    let mut words = Vec::new();
+    if args.args.is_empty() {
+        words.push(args.command.clone());
+    } else {
+        words.push(shell.try_quote_prefix_aware(&args.command)?.into_owned());
+    }
+    for arg in &args.args {
+        words.push(shell.try_quote(arg)?.into_owned());
+    }
+    let command = words.join(" ");
+    // An export, unlike an assignment prefix, reaches every command of shell text.
+    if exports.is_empty() {
+        Some(command)
+    } else {
+        Some(format!("export {}; {command}", exports.join(" ")))
+    }
+}
+
+fn is_shell_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|rest| rest == '_' || rest.is_ascii_alphanumeric())
+}
+
 fn handle_create_terminal(
     args: acp::CreateTerminalRequest,
     responder: Responder<acp::CreateTerminalResponse>,
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) {
-    let thread = match session_thread(ctx, &acp_v2::SessionId::new(args.session_id.0)) {
+    let session_id = acp_v2::SessionId::new(args.session_id.0);
+    let thread = match session_thread(ctx, &session_id) {
         Ok(t) => t,
         Err(e) => return respond_err(responder, e),
     };
-    let project = match thread
-        .read_with(cx, |thread, _cx| thread.project().clone())
+    let (project, project_dir) = match thread
+        .read_with(cx, |thread, _cx| {
+            (thread.project().clone(), session_project_dir(thread))
+        })
         .map_err(acp::Error::from)
     {
         Ok(p) => p,
         Err(e) => return respond_err(responder, e),
     };
+    let hook_commands = ctx.hooks.matching(hooks::HookEvent::PreToolUse, "Bash");
 
     cx.spawn(async move |cx| {
         let result: Result<_, acp::Error> = async {
+            let (shell, is_windows) = acp_thread::agent_terminal_shell(&project, cx);
+            let (command, command_args, env, terminal_cwd, label) = if hook_commands.is_empty() {
+                (
+                    args.command.clone(),
+                    args.args.clone(),
+                    args.env
+                        .iter()
+                        .map(|env| (env.name.clone(), env.value.clone()))
+                        .collect(),
+                    args.cwd.clone(),
+                    format!("{} {}", args.command, args.args.join(" ")),
+                )
+            } else {
+                let project_dir = project_dir.ok_or_else(|| {
+                    acp::Error::internal_error()
+                        .data("the session has no working directory to run PreToolUse hooks in")
+                })?;
+                if !project.read_with(cx, |project, _| project.is_local()) {
+                    return Err(acp::Error::internal_error().data(
+                        "PreToolUse hooks run on this machine, so they can't guard a terminal \
+                         in a remote project",
+                    ));
+                }
+                let cwd = match args.cwd.clone() {
+                    Some(cwd) if cwd.is_absolute() => cwd,
+                    Some(cwd) => {
+                        return Err(acp::Error::internal_error().data(format!(
+                            "the terminal's cwd {} isn't absolute, as ACP requires",
+                            cwd.display()
+                        )));
+                    }
+                    None => project_dir.clone(),
+                };
+                let command_line = terminal_shell_command(&args, shell.shell_kind(is_windows))
+                    .ok_or_else(|| {
+                        acp::Error::internal_error().data(
+                            "the command can't be written as POSIX shell text for PreToolUse hooks",
+                        )
+                    })?;
+                let decision = hooks::shell_command_decision(
+                    hook_commands,
+                    &session_id.0,
+                    &project_dir,
+                    &cwd,
+                    &command_line,
+                    cx.background_executor(),
+                )
+                .await;
+                if let ToolDecision::Deny { reason } = decision {
+                    return Err(acp::Error::internal_error().data(reason));
+                }
+                // The terminal runs exactly the shell text, in the directory, its hooks were shown.
+                (
+                    command_line.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    Some(cwd),
+                    command_line,
+                )
+            };
+
             let terminal_entity = acp_thread::create_terminal_entity(
-                args.command.clone(),
-                &args.args,
-                args.env
-                    .into_iter()
-                    .map(|env| (env.name, env.value))
-                    .collect(),
-                args.cwd.clone(),
+                command,
+                &command_args,
+                env,
+                terminal_cwd.clone(),
+                &shell,
+                is_windows,
                 &project,
                 cx,
             )
@@ -10432,8 +10704,8 @@ fn handle_create_terminal(
             let terminal_entity = thread.update(cx, |thread, cx| {
                 thread.register_terminal_created(
                     acp_v2::TerminalId::new(uuid::Uuid::new_v4().to_string()),
-                    format!("{} {}", args.command, args.args.join(" ")),
-                    args.cwd.clone(),
+                    label,
+                    terminal_cwd,
                     args.output_byte_limit,
                     terminal_entity,
                     cx,

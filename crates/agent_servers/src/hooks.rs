@@ -1,12 +1,16 @@
 mod decision;
 mod runner;
 
-use std::{path::Path, time::Duration};
+pub use decision::ToolDecision;
+
+use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 
 use collections::HashMap;
+use gpui::{App, BackgroundExecutor, Subscription};
+use project::{AgentId, agent_server_store::AllAgentServersSettings};
 use regex::Regex;
-use serde_json::{Map, Value};
-use settings::{AgentHookContent, AgentHooksContent};
+use serde_json::{Map, Value, json};
+use settings::{AgentHookContent, AgentHooksContent, SettingsStore};
 
 /// The Claude Code hook events Zed runs for external agents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -209,10 +213,75 @@ impl AgentHooks {
     }
 }
 
+/// An agent's hooks as the user's settings have them now.
+#[derive(Clone, Default)]
+pub struct LiveAgentHooks(Rc<RefCell<LoadedHooks>>);
+
+#[derive(Default)]
+struct LoadedHooks {
+    content: AgentHooksContent,
+    hooks: AgentHooks,
+}
+
+impl LiveAgentHooks {
+    /// Loads `agent_id`'s hooks from the user's settings, and again each time settings change,
+    /// until the returned subscription is dropped.
+    pub fn observe_settings(&self, agent_id: AgentId, cx: &mut App) -> Subscription {
+        if cx.try_global::<SettingsStore>().is_none() {
+            return Subscription::new(|| {});
+        }
+
+        self.refresh_from_settings(&agent_id, cx);
+        let hooks = self.clone();
+        cx.observe_global::<SettingsStore>(move |cx| {
+            hooks.refresh_from_settings(&agent_id, cx);
+        })
+    }
+
+    fn refresh_from_settings(&self, agent_id: &AgentId, cx: &App) {
+        let Some(settings_store) = cx.try_global::<SettingsStore>() else {
+            return;
+        };
+        let content = settings_store
+            .get::<AllAgentServersSettings>(None)
+            .get(agent_id.as_ref())
+            .map(|settings| settings.hooks().clone())
+            .unwrap_or_default();
+        let mut loaded = self.0.borrow_mut();
+        // Unchanged hooks aren't rebuilt, so their warnings aren't logged on every settings change.
+        if loaded.content != content {
+            loaded.hooks = AgentHooks::from_settings(&content);
+            loaded.content = content;
+        }
+    }
+
+    /// See [`AgentHooks::matching`].
+    pub fn matching(&self, event: HookEvent, subject: &str) -> Vec<HookCommand> {
+        self.0.borrow().hooks.matching(event, subject)
+    }
+}
+
+/// Runs `PreToolUse` hooks in `project_dir` for a shell command the agent asked Zed to start in
+/// `cwd`, as Claude Code runs them for its `Bash` tool.
+pub async fn shell_command_decision(
+    commands: Vec<HookCommand>,
+    session_id: &str,
+    project_dir: &Path,
+    cwd: &Path,
+    command_line: &str,
+    executor: &BackgroundExecutor,
+) -> ToolDecision {
+    let mut fields = Map::new();
+    fields.insert("tool_name".into(), "Bash".into());
+    fields.insert("tool_input".into(), json!({ "command": command_line }));
+    let input = hook_input(HookEvent::PreToolUse, session_id, cwd, fields);
+    decision::tool_decision(&runner::run_hooks(commands, &input, project_dir, executor).await)
+}
+
 /// The JSON a hook reads on stdin: `fields` plus Claude Code's common `session_id`, `cwd` and
 /// `hook_event_name`. There is no `transcript_path`, since a Zed thread isn't a Claude Code
 /// transcript.
-pub fn hook_input(
+fn hook_input(
     event: HookEvent,
     session_id: &str,
     cwd: &Path,
@@ -227,7 +296,6 @@ pub fn hook_input(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     fn hooks(settings: Value) -> AgentHooks {
         AgentHooks::from_settings(&serde_json::from_value(settings).expect("hooks settings"))

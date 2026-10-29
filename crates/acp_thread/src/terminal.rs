@@ -933,6 +933,8 @@ pub async fn create_terminal_entity(
     args: &[String],
     env_vars: Vec<(String, String)>,
     cwd: Option<PathBuf>,
+    shell: &Shell,
+    is_windows: bool,
     project: &Entity<Project>,
     cx: &mut AsyncApp,
 ) -> Result<Entity<terminal::Terminal>> {
@@ -952,17 +954,7 @@ pub async fn create_terminal_entity(
     disable_pagers_through_env(&mut env);
     env.extend(env_vars);
 
-    // Use remote shell or default system shell, as appropriate
-    let shell = project
-        .update(cx, |project, cx| {
-            project
-                .remote_client()
-                .and_then(|r| r.read(cx).default_system_shell())
-                .map(Shell::Program)
-        })
-        .unwrap_or_else(|| Shell::Program(get_default_system_shell_preferring_bash()));
-    let is_windows = project.read_with(cx, |project, cx| project.path_style(cx).is_windows());
-    let (task_command, task_args) = task::ShellBuilder::new(&shell, is_windows)
+    let (task_command, task_args) = task::ShellBuilder::new(shell, is_windows)
         .redirect_stdin_to_dev_null()
         .build(Some(command.clone()), &args);
 
@@ -980,6 +972,21 @@ pub async fn create_terminal_entity(
             )
         })
         .await
+}
+
+/// The shell an agent's terminal command runs in, and whether it runs on Windows: the remote
+/// host's default shell, or the local one, preferring bash.
+pub fn agent_terminal_shell(project: &Entity<Project>, cx: &mut AsyncApp) -> (Shell, bool) {
+    let shell = project
+        .update(cx, |project, cx| {
+            project
+                .remote_client()
+                .and_then(|r| r.read(cx).default_system_shell())
+                .map(Shell::Program)
+        })
+        .unwrap_or_else(|| Shell::Program(get_default_system_shell_preferring_bash()));
+    let is_windows = project.read_with(cx, |project, cx| project.path_style(cx).is_windows());
+    (shell, is_windows)
 }
 
 // Disable pagers so agent/terminal commands don't hang behind interactive UIs

@@ -35,6 +35,8 @@ use task::SpawnInTerminal;
 use util::ResultExt as _;
 use util::path_list::PathList;
 
+use crate::hooks::LiveAgentHooks;
+
 fn is_connection_closed(connection: &V2ConnectionTo<Agent>) -> bool {
     connection.is_incoming_closed() || connection.termination().is_some()
 }
@@ -352,6 +354,7 @@ impl AcpV2Connection {
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: Some(RefCell::new(Default::default())),
             accepts_subagent_updates: true,
+            hooks: LiveAgentHooks::default(),
         };
         let (mut client_runtime, shutdown) = runtime::ClientRuntime::new(context, cx);
         let dispatch_tx = client_runtime.sender();
