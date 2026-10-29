@@ -74,7 +74,11 @@ impl HookCommand {
             Some("`if`".to_string())
         } else if hook.shell.is_some() {
             Some("`shell`".to_string())
-        } else if hook.run_async == Some(true) {
+        } else if hook
+            .run_async
+            .as_ref()
+            .is_some_and(|run_async| run_async != &Value::Bool(false))
+        {
             Some("`async`".to_string())
         } else {
             None
@@ -90,12 +94,16 @@ impl HookCommand {
             log::warn!("skipping a {} hook without a `command`", event.name());
             return None;
         };
-        let blocks_on_failure = match hook.on_failure.as_deref() {
-            None | Some("continue") => false,
-            Some("block") => true,
-            Some(other) => {
+        let blocks_on_failure = match hook
+            .on_failure
+            .as_ref()
+            .map(|value| (value, value.as_str()))
+        {
+            None | Some((_, Some("continue"))) => false,
+            Some((_, Some("block"))) => true,
+            Some((other, _)) => {
                 log::warn!(
-                    "skipping {} hook {command:?}: `onFailure` must be \"continue\" or \"block\", not {other:?}",
+                    "skipping {} hook {command:?}: `onFailure` must be \"continue\" or \"block\", not {other}",
                     event.name()
                 );
                 return None;
@@ -495,6 +503,21 @@ mod tests {
                 { "type": "command", "command": "background", "async": true },
                 { "type": "command", "command": "unknown-failure", "onFailure": "retry" },
                 { "type": "command", "command": "guard", "async": false }
+            ] }]
+        }));
+        assert_eq!(commands(&hooks, HookEvent::PreToolUse, "Bash"), ["guard"]);
+    }
+
+    #[test]
+    fn wrongly_typed_unsupported_fields_still_skip_the_hook() {
+        let hooks = hooks(json!({
+            "PreToolUse": [{ "hooks": [
+                { "type": "command", "command": "exec-form", "args": "x" },
+                { "type": "command", "command": "conditional", "if": ["Bash(rm *)"] },
+                { "type": "command", "command": "powershell", "shell": { "name": "pwsh" } },
+                { "type": "command", "command": "background", "async": "yes" },
+                { "type": "command", "command": "failure-flag", "onFailure": true },
+                { "type": "command", "command": "guard" }
             ] }]
         }));
         assert_eq!(commands(&hooks, HookEvent::PreToolUse, "Bash"), ["guard"]);

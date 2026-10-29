@@ -947,20 +947,23 @@ pub struct AgentHookContent {
     ///
     /// Default: 600, or 30 for `UserPromptSubmit`
     pub timeout: Option<u64>,
+    // Raw JSON, so a wrongly typed value still reads as set and its hook is skipped, not widened.
     /// Exec-form arguments. Not supported: a hook that sets them is skipped.
-    pub args: Option<Vec<String>>,
+    pub args: Option<serde_json::Value>,
     /// A permission-rule condition narrowing when the hook runs. Not supported: a hook that
     /// sets it is skipped.
     #[serde(rename = "if")]
-    pub condition: Option<String>,
+    pub condition: Option<serde_json::Value>,
     /// The shell to run the command in. Not supported: a hook that sets it is skipped.
-    pub shell: Option<String>,
-    /// Whether the hook runs in the background. Not supported: a hook that sets it is skipped.
+    pub shell: Option<serde_json::Value>,
+    /// Whether the hook runs in the background. Not supported: a hook that sets it to anything
+    /// but `false` is skipped.
     #[serde(rename = "async")]
-    pub run_async: Option<bool>,
-    /// `block` makes a failed or timed-out hook block the action.
+    pub run_async: Option<serde_json::Value>,
+    /// `block` makes a failed or timed-out hook block the action; `continue` is the default.
+    /// A hook with any other value is skipped.
     #[serde(rename = "onFailure")]
-    pub on_failure: Option<String>,
+    pub on_failure: Option<serde_json::Value>,
 }
 
 /// A persisted sandbox writable-path grant. Deserializes from either a bare
