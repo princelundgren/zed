@@ -11,6 +11,14 @@ on:
       branch:
         description: Branch of this fork to test
         required: true
+      # Linux for when GitHub has no macOS runner free; clippy stays on macOS.
+      test_runner:
+        description: Runner for the test job
+        type: choice
+        options:
+          - macos-latest
+          - ubuntu-22.04
+        default: macos-latest
 
 permissions:
   contents: read
@@ -20,7 +28,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: macos-latest
+    runs-on: ${{ inputs.test_runner }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,11 +44,18 @@ jobs:
             target
           key: test-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: ./script/linux
+
       - name: Format
         run: cargo fmt --check
 
       - name: Test
         run: cargo test -p settings_content -p agent_servers -p settings_ui
+        env:
+          CC: ${{ runner.os == 'Linux' && 'clang' || 'cc' }}
+          CXX: ${{ runner.os == 'Linux' && 'clang++' || 'c++' }}
 
       - name: Cache size
         run: du -sh target ~/.cargo/registry ~/.cargo/git >> "$GITHUB_STEP_SUMMARY"
