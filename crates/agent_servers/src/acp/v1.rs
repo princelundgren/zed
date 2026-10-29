@@ -9029,6 +9029,53 @@ exit 7
 
     #[cfg(unix)]
     #[gpui::test]
+    async fn hooks_stay_when_the_agent_leaves_settings(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let _thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("hooks-session"),
+                    project,
+                    PathList::new(&[project_dir.path()]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load hooks session");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "PreToolUse": [hook_group("Bash", "echo 'still guarded' >&2; exit 2".into())],
+            }),
+            cx,
+        );
+        // Renaming or removing the agent, or a settings error under `agent_servers`, leaves the
+        // user's settings without its entry.
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store
+                .set_user_settings(r#"{ "agent_servers": {} }"#, cx)
+                .expect("settings without the agent");
+        });
+        cx.executor().allow_parking();
+
+        let error = agent
+            .send_request(acp::CreateTerminalRequest::new(
+                acp::SessionId::new("hooks-session"),
+                "true",
+            ))
+            .block_task()
+            .await
+            .expect_err("the connection keeps its hooks");
+
+        assert_eq!(error.data, Some(serde_json::json!("still guarded")));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
     async fn pre_tool_use_hook_denies_a_file_write(cx: &mut gpui::TestAppContext) {
         let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
         let (connection, project, _, _, _, _, _keep_agent_alive) =

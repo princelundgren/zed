@@ -239,6 +239,8 @@ impl LiveAgentHooks {
     }
 
     fn refresh_from_settings(&self, agent_id: &AgentId, cx: &App) {
+        // An agent missing from settings (renamed, removed, or dropped by a settings error) keeps
+        // the hooks it last had: dropping them would leave its sessions unguarded.
         let Some(content) = configured_hooks(agent_id, cx) else {
             return;
         };
@@ -266,16 +268,14 @@ pub fn agent_has_hooks(agent_id: &AgentId, cx: &App) -> bool {
     })
 }
 
-/// `agent_id`'s hooks in the user's settings, or `None` before settings are loaded.
+/// `agent_id`'s hooks in the user's settings, or `None` before settings are loaded or while the
+/// settings have no entry for the agent.
 fn configured_hooks(agent_id: &AgentId, cx: &App) -> Option<AgentHooksContent> {
     let settings_store = cx.try_global::<SettingsStore>()?;
-    Some(
-        settings_store
-            .get::<AllAgentServersSettings>(None)
-            .get(agent_id.as_ref())
-            .map(|settings| settings.hooks().clone())
-            .unwrap_or_default(),
-    )
+    settings_store
+        .get::<AllAgentServersSettings>(None)
+        .get(agent_id.as_ref())
+        .map(|settings| settings.hooks().clone())
 }
 
 /// Runs `PreToolUse` hooks in `project_dir` for a shell command the agent asked Zed to start in
