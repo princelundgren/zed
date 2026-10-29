@@ -9207,10 +9207,12 @@ exit 7
         let (connection, project, _, _, _, _, _keep_agent_alive) =
             connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
         let agent = agent_receiver.await.expect("fake agent handle");
-        let fs = project.read_with(cx, |project, _| project.fs().as_fake());
-        fs.insert_tree("/home", serde_json::json!({ ".ssh": {} }))
+        let fs = project.read_with(cx, |project, _| project.fs().clone());
+        fs.as_fake()
+            .insert_tree("/home", serde_json::json!({ ".ssh": {} }))
             .await;
-        fs.insert_symlink("/a/new.md", PathBuf::from("/home/.ssh/authorized_keys"))
+        fs.as_fake()
+            .insert_symlink("/a/new.md", PathBuf::from("/home/.ssh/authorized_keys"))
             .await;
         let project_dir = tempfile::tempdir().expect("project directory");
         let _thread = cx
