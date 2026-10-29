@@ -8978,6 +8978,56 @@ exit 7
         );
     }
 
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn pre_tool_use_ask_refuses_a_terminal(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let _thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("hooks-session"),
+                    project,
+                    PathList::new(&[project_dir.path()]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load hooks session");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "PreToolUse": [hook_group(
+                    "Bash",
+                    r#"echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask"}}'"#
+                        .into(),
+                )],
+            }),
+            cx,
+        );
+        cx.executor().allow_parking();
+
+        let error = agent
+            .send_request(acp::CreateTerminalRequest::new(
+                acp::SessionId::new("hooks-session"),
+                "true",
+            ))
+            .block_task()
+            .await
+            .expect_err("an ask refuses the command");
+
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!(
+                "a PreToolUse hook asked to confirm this command, and Zed can't ask before a \
+                 terminal starts"
+            ))
+        );
+    }
+
     #[test]
     fn a_terminal_without_args_reaches_hooks_as_its_shell_text() {
         let request =
@@ -11312,8 +11362,18 @@ fn handle_create_terminal(
                     cx.background_executor(),
                 )
                 .await;
-                if let ToolDecision::Deny { reason } = decision {
-                    return Err(acp::Error::internal_error().data(reason));
+                match decision {
+                    ToolDecision::Deny { reason } => {
+                        return Err(acp::Error::internal_error().data(reason));
+                    }
+                    // A terminal request carries no tool call to show a prompt on.
+                    ToolDecision::Ask => {
+                        return Err(acp::Error::internal_error().data(
+                            "a PreToolUse hook asked to confirm this command, and Zed can't ask \
+                             before a terminal starts",
+                        ));
+                    }
+                    ToolDecision::Allow | ToolDecision::Undecided => {}
                 }
                 // The terminal runs exactly the shell text, in the directory, its hooks were shown.
                 (
