@@ -1,7 +1,7 @@
 mod decision;
 mod runner;
 
-pub use decision::{PromptOutcome, ToolDecision};
+pub use decision::{PromptOutcome, StopOutcome, ToolDecision};
 
 use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 
@@ -321,6 +321,21 @@ pub async fn submitted_prompt_outcome(
     fields.insert("prompt".into(), prompt.into());
     let input = hook_input(HookEvent::UserPromptSubmit, session_id, project_dir, fields);
     decision::prompt_outcome(&runner::run_hooks(commands, &input, project_dir, executor).await)
+}
+
+/// Runs `Stop` hooks in `project_dir` once the agent ends its turn. `stop_hook_active` says a
+/// `Stop` hook already kept this turn going.
+pub async fn stop_hook_outcome(
+    commands: Vec<HookCommand>,
+    session_id: &str,
+    project_dir: &Path,
+    stop_hook_active: bool,
+    executor: &BackgroundExecutor,
+) -> StopOutcome {
+    let mut fields = Map::new();
+    fields.insert("stop_hook_active".into(), stop_hook_active.into());
+    let input = hook_input(HookEvent::Stop, session_id, project_dir, fields);
+    decision::stop_outcome(&runner::run_hooks(commands, &input, project_dir, executor).await)
 }
 
 /// The JSON a hook reads on stdin: `fields` plus Claude Code's common `session_id`, `cwd` and

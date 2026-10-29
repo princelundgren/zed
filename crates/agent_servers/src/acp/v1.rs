@@ -49,7 +49,7 @@ use acp_thread::{AcpThread, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
-use crate::hooks::{self, LiveAgentHooks, PromptOutcome, SessionSource, ToolDecision};
+use crate::hooks::{self, LiveAgentHooks, PromptOutcome, SessionSource, StopOutcome, ToolDecision};
 use crate::{CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
@@ -1715,6 +1715,7 @@ impl AgentConnection for AcpConnection {
         let conn = self.connection.clone();
         let sessions = self.sessions.clone();
         let prompt_hooks = self.hooks.matching(hooks::HookEvent::UserPromptSubmit, "");
+        let stop_hooks = self.hooks.matching(hooks::HookEvent::Stop, "");
         let (project_dir, session_start_context) = self
             .sessions
             .borrow()
@@ -1743,13 +1744,13 @@ impl AgentConnection for AcpConnection {
             let prompt_outcome = if prompt_hooks.is_empty() {
                 None
             } else {
-                let project_dir = project_dir.context(
+                let project_dir = project_dir.as_deref().context(
                     "the session has no working directory to run UserPromptSubmit hooks in",
                 )?;
                 let outcome = hooks::submitted_prompt_outcome(
                     prompt_hooks,
                     &session_id.0,
-                    &project_dir,
+                    project_dir,
                     &prompt_text(&params.prompt),
                     &executor,
                 )
@@ -1777,50 +1778,46 @@ impl AgentConnection for AcpConnection {
                 );
             }
 
-            let result = conn.send_request(params).block_task().await;
-
-            let mut suppress_abort_err = false;
-
-            if let Some(session) = sessions.borrow_mut().get_mut(&session_id) {
-                suppress_abort_err = session.suppress_abort_err;
-                session.suppress_abort_err = false;
-            }
-
-            match result {
-                Ok(response) => Ok(response),
-                Err(err) => {
-                    if err.code != ErrorCode::InternalError {
-                        anyhow::bail!(err)
-                    }
-
-                    let Some(data) = &err.data else {
-                        anyhow::bail!(err)
-                    };
-
-                    // Temporary workaround until the following PR is generally available:
-                    // https://github.com/google-gemini/gemini-cli/pull/6656
-
-                    #[derive(Deserialize)]
-                    #[serde(deny_unknown_fields)]
-                    struct ErrorDetails {
-                        details: Box<str>,
-                    }
-
-                    match serde_json::from_value(data.clone()) {
-                        Ok(ErrorDetails { details }) => {
-                            if suppress_abort_err
-                                && (details.contains("This operation was aborted")
-                                    || details.contains("The user aborted a request"))
-                            {
-                                Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
-                            } else {
-                                Err(anyhow!(details))
-                            }
-                        }
-                        Err(_) => Err(anyhow!(err)),
-                    }
+            let result = send_prompt(&conn, &sessions, &session_id, params).await;
+            let mut cancelled = take_cancellation(&sessions, &session_id);
+            let mut response = result?;
+            let mut follow_ups = 0;
+            while response.stop_reason == acp::StopReason::EndTurn
+                && !cancelled
+                && !stop_hooks.is_empty()
+            {
+                let Some(project_dir) = project_dir.as_deref() else {
+                    log::warn!("the session has no working directory to run Stop hooks in");
+                    break;
+                };
+                let outcome = hooks::stop_hook_outcome(
+                    stop_hooks.clone(),
+                    &session_id.0,
+                    project_dir,
+                    follow_ups > 0,
+                    &executor,
+                )
+                .await;
+                if take_cancellation(&sessions, &session_id) {
+                    return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
                 }
+                let StopOutcome::Continue { reason } = outcome else {
+                    break;
+                };
+                // As in Claude Code, the hook past the cap runs but can't keep the turn going.
+                if follow_ups == MAX_STOP_HOOK_FOLLOW_UPS {
+                    break;
+                }
+                follow_ups += 1;
+                let follow_up = acp::PromptRequest::new(
+                    acp::SessionId::new(session_id.0.clone()),
+                    vec![reason.into()],
+                );
+                let result = send_prompt(&conn, &sessions, &session_id, follow_up).await;
+                cancelled = take_cancellation(&sessions, &session_id);
+                response = result?;
             }
+            Ok(response)
         })
     }
 
@@ -9040,12 +9037,14 @@ exit 7
         assert_eq!(terminal_shell_command(&request, ShellKind::Fish), None);
     }
 
-    /// An agent that answers `session/new` with `hooks-session`, loads any session, and records
-    /// the text blocks of each prompt it gets.
+    /// An agent that answers `session/new` with `hooks-session`, loads any session, records the
+    /// text blocks of each prompt it gets, and ends each turn with the next queued stop reason, or
+    /// `EndTurn`.
     struct PromptRecordingAgent {
         harness: test_support::FakeAcpConnectionHarness,
         project: Entity<Project>,
         prompts: Arc<Mutex<Vec<Vec<String>>>>,
+        stop_reasons: Arc<Mutex<std::collections::VecDeque<acp::StopReason>>>,
         _io_tasks: [Task<()>; 2],
     }
 
@@ -9057,6 +9056,7 @@ exit 7
             let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
             let mut harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
             let prompts = Arc::new(Mutex::new(Vec::new()));
+            let stop_reasons = Arc::new(Mutex::new(std::collections::VecDeque::new()));
             let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
             let agent = Agent
                 .builder()
@@ -9076,6 +9076,7 @@ exit 7
                 .on_receive_request(
                     {
                         let prompts = prompts.clone();
+                        let stop_reasons = stop_reasons.clone();
                         async move |request: acp::PromptRequest, responder, _cx| {
                             let texts = request
                                 .prompt
@@ -9086,7 +9087,12 @@ exit 7
                                 })
                                 .collect();
                             prompts.lock().expect("recorded prompts").push(texts);
-                            responder.respond(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                            let stop_reason = stop_reasons
+                                .lock()
+                                .expect("queued stop reasons")
+                                .pop_front()
+                                .unwrap_or(acp::StopReason::EndTurn);
+                            responder.respond(acp::PromptResponse::new(stop_reason))
                         }
                     },
                     agent_client_protocol::on_receive_request!(),
@@ -9113,6 +9119,7 @@ exit 7
                 harness,
                 project,
                 prompts,
+                stop_reasons,
                 _io_tasks: [agent_io_task, client_io_task],
             }
         }
@@ -9171,6 +9178,14 @@ exit 7
 
         fn prompts(&self) -> Vec<Vec<String>> {
             self.prompts.lock().expect("recorded prompts").clone()
+        }
+
+        #[cfg(unix)]
+        fn end_next_turn_with(&self, stop_reason: acp::StopReason) {
+            self.stop_reasons
+                .lock()
+                .expect("queued stop reasons")
+                .push_back(stop_reason);
         }
     }
 
@@ -9379,6 +9394,88 @@ exit 7
         let response = prompt.await.expect("cancelled prompt");
         assert_eq!(response.stop_reason, acp::StopReason::Cancelled);
         assert!(agent.prompts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn blocking_stop_hook_sends_reason_as_follow_up(cx: &mut gpui::TestAppContext) {
+        let agent = PromptRecordingAgent::connect(cx).await;
+        let project_dir = tempfile::tempdir().expect("project directory");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "Stop": [hook_group("", "echo 'run the tests' >&2; exit 2".into())],
+            }),
+            cx,
+        );
+        cx.executor().allow_parking();
+
+        let thread = agent.new_session(project_dir.path(), cx).await;
+        let response = agent.prompt(&thread, "Hello", cx).await.expect("prompt");
+
+        // A hook that always blocks keeps the turn going eight times, then lets it end.
+        let mut expected = vec![vec!["Hello"]];
+        expected.extend(std::iter::repeat_n(vec!["run the tests"], 8));
+        assert_eq!(agent.prompts(), expected);
+        assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn follow_up_marks_stop_hook_active(cx: &mut gpui::TestAppContext) {
+        let agent = PromptRecordingAgent::connect(cx).await;
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let input_path = project_dir.path().join("hook-input.json");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "Stop": [hook_group(
+                    "",
+                    format!(
+                        "cat > '{0}'; if grep -q '\"stop_hook_active\":false' '{0}'; then \
+                         echo 'keep going' >&2; exit 2; fi",
+                        input_path.display()
+                    ),
+                )],
+            }),
+            cx,
+        );
+        cx.executor().allow_parking();
+
+        let thread = agent.new_session(project_dir.path(), cx).await;
+        agent.prompt(&thread, "Hello", cx).await.expect("prompt");
+
+        assert_eq!(agent.prompts(), [vec!["Hello"], vec!["keep going"]]);
+        assert_eq!(
+            read_hook_input(&input_path),
+            serde_json::json!({
+                "session_id": "hooks-session",
+                "cwd": project_dir.path(),
+                "hook_event_name": "Stop",
+                "stop_hook_active": true,
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn cancelled_turn_runs_no_stop_hook(cx: &mut gpui::TestAppContext) {
+        let agent = PromptRecordingAgent::connect(cx).await;
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let ran_path = project_dir.path().join("stop-hook-ran");
+        set_test_agent_hooks(
+            serde_json::json!({
+                "Stop": [hook_group("", format!("touch '{}'; exit 2", ran_path.display()))],
+            }),
+            cx,
+        );
+        cx.executor().allow_parking();
+        agent.end_next_turn_with(acp::StopReason::Cancelled);
+
+        let thread = agent.new_session(project_dir.path(), cx).await;
+        let response = agent.prompt(&thread, "Hello", cx).await.expect("prompt");
+
+        assert_eq!(response.stop_reason, acp::StopReason::Cancelled);
+        assert_eq!(agent.prompts(), [vec!["Hello"]]);
+        assert!(!ran_path.exists());
     }
 
     #[gpui::test]
@@ -11011,6 +11108,61 @@ fn handle_session_notification(
                         })
                         .log_err();
                 }
+            }
+        }
+    }
+}
+
+/// How many times in a row `Stop` hooks may keep one turn going, as in Claude Code.
+const MAX_STOP_HOOK_FOLLOW_UPS: usize = 8;
+
+/// Sends a prompt and returns the agent's answer, reading an abort error after a cancel as a
+/// cancelled turn. The cancel stays recorded on the session.
+async fn send_prompt(
+    conn: &ConnectionTo<Agent>,
+    sessions: &RefCell<HashMap<acp_v2::SessionId, AcpSession>>,
+    session_id: &acp_v2::SessionId,
+    params: acp::PromptRequest,
+) -> Result<acp::PromptResponse> {
+    let result = conn.send_request(params).block_task().await;
+
+    let suppress_abort_err = sessions
+        .borrow()
+        .get(session_id)
+        .is_some_and(|session| session.suppress_abort_err);
+
+    match result {
+        Ok(response) => Ok(response),
+        Err(err) => {
+            if err.code != ErrorCode::InternalError {
+                anyhow::bail!(err)
+            }
+
+            let Some(data) = &err.data else {
+                anyhow::bail!(err)
+            };
+
+            // Temporary workaround until the following PR is generally available:
+            // https://github.com/google-gemini/gemini-cli/pull/6656
+
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ErrorDetails {
+                details: Box<str>,
+            }
+
+            match serde_json::from_value(data.clone()) {
+                Ok(ErrorDetails { details }) => {
+                    if suppress_abort_err
+                        && (details.contains("This operation was aborted")
+                            || details.contains("The user aborted a request"))
+                    {
+                        Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
+                    } else {
+                        Err(anyhow!(details))
+                    }
+                }
+                Err(_) => Err(anyhow!(err)),
             }
         }
     }
