@@ -52,7 +52,9 @@ client; one connected before its hooks were added runs without them until it rec
 
 Branches: `build` (the default) holds this README and the fork's workflows, `acp-hooks` holds
 the hooks on top of upstream Zed. Builds come from the fork's manually run workflows:
-`fork_test_hooks.yml` tests a branch and `fork_bundle_mac.yml` builds a macOS app from one.
+`fork_test_hooks.yml` tests a branch, `fork_bundle_mac.yml` builds a macOS app from one, and
+`fork_release_mac.yml` publishes a successful build's DMG as a release, since run artifacts
+expire.
 
 ---
 

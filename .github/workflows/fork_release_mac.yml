@@ -1,0 +1,91 @@
+name: Fork release (macOS)
+
+# Publishes the DMG of a successful "Fork bundle (macOS)" run as a GitHub release, since a run's
+# artifact expires and a release asset doesn't. The release is tagged at the commit the run built.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: ID of a successful Fork bundle (macOS) run in this repository
+        required: true
+      # Runs from before the bundle workflow recorded built-commit.txt need the commit given here.
+      commit:
+        description: Built commit, only for a run whose artifact has no built-commit.txt
+        required: false
+        default: ""
+      branch:
+        description: Branch of this fork that must contain that commit
+        required: false
+        default: acp-hooks
+
+permissions: {}
+
+concurrency:
+  group: fork-release-mac
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check the run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          case "$RUN_ID" in *[!0-9]* | '') echo "run_id must be a number" >&2; exit 1 ;; esac
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > run.json
+          # From build only, so the run used this branch's copy of the bundle workflow.
+          jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .path == ".github/workflows/fork_bundle_mac.yml"
+            and .event == "workflow_dispatch"
+            and .head_branch == "build"
+            and .conclusion == "success"
+            and .repository.full_name == $repo
+            and .head_repository.full_name == $repo' run.json > /dev/null \
+            || { echo "run $RUN_ID is not a successful fork_bundle_mac.yml run dispatched from build" >&2; exit 1; }
+
+      - name: Download the DMG and its commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          GIVEN_COMMIT: ${{ inputs.commit }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -D dist
+          dmg="$(find dist -name Zed-aarch64.dmg -type f)"
+          [ -n "$dmg" ] && [ "$(printf '%s\n' "$dmg" | wc -l)" -eq 1 ] \
+            || { echo "expected exactly one Zed-aarch64.dmg in run $RUN_ID" >&2; exit 1; }
+          recorded="$(find dist -name built-commit.txt -type f -exec cat {} \;)"
+          if [ -n "$recorded" ]; then
+            [ -z "$GIVEN_COMMIT" ] || [ "$GIVEN_COMMIT" = "$recorded" ] \
+              || { echo "commit input $GIVEN_COMMIT differs from the run's built-commit.txt $recorded" >&2; exit 1; }
+            commit="$recorded"
+          else
+            commit="$GIVEN_COMMIT"
+            [ -n "$commit" ] || { echo "run $RUN_ID records no built commit; give one as the commit input" >&2; exit 1; }
+          fi
+          case "$commit" in *[!0-9a-f]*) echo "commit must be a full lowercase SHA" >&2; exit 1 ;; esac
+          [ "${#commit}" -eq 40 ] || { echo "commit must be a full 40-character SHA" >&2; exit 1; }
+          # A SHA resolves across the whole fork network, so require that this fork's branch holds it.
+          status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$commit...refs/heads/$BRANCH" --jq .status)"
+          case "$status" in identical | ahead) ;; *)
+            echo "$commit is not on $BRANCH of $GITHUB_REPOSITORY (compare: $status)" >&2; exit 1 ;;
+          esac
+          echo "BUILT_COMMIT=$commit" >> "$GITHUB_ENV"
+          mv "$dmg" Zed-aarch64.dmg
+          sha256sum Zed-aarch64.dmg > SHA256SUMS
+          { echo "Built commit: $commit"; echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          tag="zed-dev-$RUN_ID"
+          gh release create "$tag" Zed-aarch64.dmg SHA256SUMS -R "$GITHUB_REPOSITORY" \
+            --target "$BUILT_COMMIT" --title "Zed Dev ($tag)" \
+            --notes "Ad-hoc-signed Zed Dev DMG from run $RUN_ID, built from commit $BUILT_COMMIT."

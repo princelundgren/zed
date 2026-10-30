@@ -32,7 +32,9 @@ jobs:
 
       - name: Checksum
         run: |
+          git rev-parse HEAD > target/aarch64-apple-darwin/release/built-commit.txt
           {
+            echo "Built commit: $(cat target/aarch64-apple-darwin/release/built-commit.txt)"
             echo '```'
             shasum -a 256 target/aarch64-apple-darwin/release/Zed-aarch64.dmg
             echo '```'
@@ -41,6 +43,8 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: zed-dev-${{ github.run_number }}
-          path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+          path: |
+            target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+            target/aarch64-apple-darwin/release/built-commit.txt
           if-no-files-found: error
           retention-days: 14
