@@ -64,21 +64,24 @@ jobs:
             [ -z "$GIVEN_COMMIT" ] || [ "$GIVEN_COMMIT" = "$recorded" ] \
               || { echo "commit input $GIVEN_COMMIT differs from the run's built-commit.txt $recorded" >&2; exit 1; }
             commit="$recorded"
+            provenance="recorded by the build"
           else
             commit="$GIVEN_COMMIT"
             [ -n "$commit" ] || { echo "run $RUN_ID records no built commit; give one as the commit input" >&2; exit 1; }
+            provenance="given by hand, not recorded by the build"
           fi
           case "$commit" in *[!0-9a-f]*) echo "commit must be a full lowercase SHA" >&2; exit 1 ;; esac
           [ "${#commit}" -eq 40 ] || { echo "commit must be a full 40-character SHA" >&2; exit 1; }
+          case "$BRANCH" in *[!A-Za-z0-9._/-]* | '' | -* | *..*) echo "branch name $BRANCH is not allowed" >&2; exit 1 ;; esac
           # A SHA resolves across the whole fork network, so require that this fork's branch holds it.
           status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$commit...refs/heads/$BRANCH" --jq .status)"
           case "$status" in identical | ahead) ;; *)
             echo "$commit is not on $BRANCH of $GITHUB_REPOSITORY (compare: $status)" >&2; exit 1 ;;
           esac
-          echo "BUILT_COMMIT=$commit" >> "$GITHUB_ENV"
+          { echo "BUILT_COMMIT=$commit"; echo "PROVENANCE=$provenance"; } >> "$GITHUB_ENV"
           mv "$dmg" Zed-aarch64.dmg
           sha256sum Zed-aarch64.dmg > SHA256SUMS
-          { echo "Built commit: $commit"; echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "Built commit: $commit ($provenance)"; echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Publish
         env:
@@ -86,6 +89,9 @@ jobs:
           RUN_ID: ${{ inputs.run_id }}
         run: |
           tag="zed-dev-$RUN_ID"
+          # Creating the tag first fails if it exists, so a release never reuses a tag that points
+          # elsewhere: gh release create ignores --target for an existing tag.
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$tag" -f "sha=$BUILT_COMMIT" > /dev/null
           gh release create "$tag" Zed-aarch64.dmg SHA256SUMS -R "$GITHUB_REPOSITORY" \
-            --target "$BUILT_COMMIT" --title "Zed Dev ($tag)" \
-            --notes "Ad-hoc-signed Zed Dev DMG from run $RUN_ID, built from commit $BUILT_COMMIT."
+            --verify-tag --latest=false --title "Zed Dev ($tag)" \
+            --notes "Ad-hoc-signed Zed Dev DMG from run $RUN_ID, built from commit $BUILT_COMMIT ($PROVENANCE)."
