@@ -8961,6 +8961,10 @@ exit 7
             .expect_err("the hook denies the command");
 
         assert_eq!(error.data, Some(serde_json::json!("no force pushes")));
+        assert_eq!(
+            error.message,
+            "Refused by Zed's PreToolUse hooks: no force pushes"
+        );
         let hook_input: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&hook_input_path).expect("hook input"))
                 .expect("hook input JSON");
@@ -9122,6 +9126,10 @@ exit 7
             .expect_err("the hook denies the write");
 
         assert_eq!(error.data, Some(serde_json::json!("no dotfiles")));
+        assert_eq!(
+            error.message,
+            "Refused by Zed's PreToolUse hooks: no dotfiles"
+        );
         assert_eq!(
             read_hook_input(&input_path),
             serde_json::json!({
@@ -11338,7 +11346,7 @@ fn handle_write_text_file(
             } else {
                 let project_dir = pre_tool_use_hook_dir(project_dir, &project, cx)?;
                 let path = hook_file_path(&args.path).ok_or_else(|| {
-                    acp::Error::internal_error().data(format!(
+                    pre_tool_use_refusal(format!(
                         "the file path {} must be absolute and without `..` for PreToolUse \
                          hooks to read it",
                         args.path.display()
@@ -11349,7 +11357,7 @@ fn handle_write_text_file(
                     resolved_file_path(fs.as_ref(), &path)
                         .await
                         .ok_or_else(|| {
-                            acp::Error::internal_error().data(format!(
+                            pre_tool_use_refusal(format!(
                                 "the file path {} leads through something Zed can't resolve, \
                                  such as a symlink to a missing file, so PreToolUse hooks \
                                  can't be shown the file it writes",
@@ -11357,7 +11365,7 @@ fn handle_write_text_file(
                             ))
                         })?;
                 let file_path = resolved_path.to_str().ok_or_else(|| {
-                    acp::Error::internal_error().data(format!(
+                    pre_tool_use_refusal(format!(
                         "the file path {} resolves to a path that isn't UTF-8",
                         path.display()
                     ))
@@ -11376,11 +11384,11 @@ fn handle_write_text_file(
                 .await;
                 match decision {
                     ToolDecision::Deny { reason } => {
-                        return Err(acp::Error::internal_error().data(reason));
+                        return Err(pre_tool_use_refusal(reason));
                     }
                     // A file write carries no tool call to show a prompt on.
                     ToolDecision::Ask => {
-                        return Err(acp::Error::internal_error().data(
+                        return Err(pre_tool_use_refusal(
                             "a PreToolUse hook asked to confirm this write, and Zed can't ask \
                              before writing a file",
                         ));
@@ -11817,7 +11825,7 @@ fn handle_create_terminal(
                 let cwd = match args.cwd.clone() {
                     Some(cwd) if cwd.is_absolute() => cwd,
                     Some(cwd) => {
-                        return Err(acp::Error::internal_error().data(format!(
+                        return Err(pre_tool_use_refusal(format!(
                             "the terminal's cwd {} isn't absolute, as ACP requires",
                             cwd.display()
                         )));
@@ -11826,7 +11834,7 @@ fn handle_create_terminal(
                 };
                 let command_line = terminal_shell_command(&args, shell.shell_kind(is_windows))
                     .ok_or_else(|| {
-                        acp::Error::internal_error().data(
+                        pre_tool_use_refusal(
                             "the command can't be written as POSIX shell text for PreToolUse hooks",
                         )
                     })?;
@@ -11841,11 +11849,11 @@ fn handle_create_terminal(
                 .await;
                 match decision {
                     ToolDecision::Deny { reason } => {
-                        return Err(acp::Error::internal_error().data(reason));
+                        return Err(pre_tool_use_refusal(reason));
                     }
                     // A terminal request carries no tool call to show a prompt on.
                     ToolDecision::Ask => {
-                        return Err(acp::Error::internal_error().data(
+                        return Err(pre_tool_use_refusal(
                             "a PreToolUse hook asked to confirm this command, and Zed can't ask \
                              before a terminal starts",
                         ));
@@ -11952,15 +11960,23 @@ fn pre_tool_use_hook_dir(
     cx: &mut AsyncApp,
 ) -> Result<PathBuf, acp::Error> {
     let project_dir = project_dir.ok_or_else(|| {
-        acp::Error::internal_error()
-            .data("the session has no working directory to run PreToolUse hooks in")
+        pre_tool_use_refusal("the session has no working directory to run PreToolUse hooks in")
     })?;
     if !project.read_with(cx, |project, _| project.is_local()) {
-        return Err(acp::Error::internal_error().data(
+        return Err(pre_tool_use_refusal(
             "PreToolUse hooks run on this machine, so they can't guard a tool in a remote project",
         ));
     }
     Ok(project_dir)
+}
+
+/// The error for a terminal or file write that `PreToolUse` hooks refused, or couldn't be run
+/// for. Agents show an error's message rather than its data, so `reason` is in both.
+fn pre_tool_use_refusal(reason: impl Into<String>) -> acp::Error {
+    let reason = reason.into();
+    let mut error = acp::Error::internal_error().data(reason.clone());
+    error.message = format!("Refused by Zed's PreToolUse hooks: {reason}");
+    error
 }
 
 fn handle_kill_terminal(
