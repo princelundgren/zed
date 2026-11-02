@@ -54,7 +54,8 @@ Branches: `build` (the default) holds this README and the fork's workflows, `acp
 the hooks on top of upstream Zed. Builds come from the fork's manually run workflows:
 `fork_test_hooks.yml` tests a branch, `fork_bundle_mac.yml` builds a macOS app from one, and
 `fork_release_mac.yml` publishes a successful build's DMG as a release, since run artifacts
-expire.
+expire. The design, its reasons and its limits are in
+[docs/fork/agent-hooks.md](docs/fork/agent-hooks.md).
 
 ---
 
