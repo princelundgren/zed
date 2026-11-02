@@ -2666,6 +2666,22 @@ mod tests {
     }
 
     #[test]
+    fn pre_tool_use_refusal_cuts_a_long_reason_short_in_the_message_only() {
+        let reason = "é".repeat(5000);
+
+        let error = pre_tool_use_refusal(reason.clone());
+
+        assert_eq!(error.data, Some(serde_json::json!(reason)));
+        assert_eq!(
+            error.message,
+            format!(
+                "Zed's PreToolUse hooks block this: {}… (the full reason is in the error's data)",
+                "é".repeat(4096)
+            )
+        );
+    }
+
+    #[test]
     fn test_legacy_modes_use_config_choices_without_overriding_config_options() {
         let id = acp::SessionModeId::new("opaque/手動");
         let meta =
@@ -8963,7 +8979,7 @@ exit 7
         assert_eq!(error.data, Some(serde_json::json!("no force pushes")));
         assert_eq!(
             error.message,
-            "Refused by Zed's PreToolUse hooks: no force pushes"
+            "Zed's PreToolUse hooks block this: no force pushes"
         );
         let hook_input: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&hook_input_path).expect("hook input"))
@@ -9128,7 +9144,7 @@ exit 7
         assert_eq!(error.data, Some(serde_json::json!("no dotfiles")));
         assert_eq!(
             error.message,
-            "Refused by Zed's PreToolUse hooks: no dotfiles"
+            "Zed's PreToolUse hooks block this: no dotfiles"
         );
         assert_eq!(
             read_hook_input(&input_path),
@@ -11971,11 +11987,20 @@ fn pre_tool_use_hook_dir(
 }
 
 /// The error for a terminal or file write that `PreToolUse` hooks refused, or couldn't be run
-/// for. Agents show an error's message rather than its data, so `reason` is in both.
+/// for. Agents show an error's message rather than its data, so the message carries `reason`,
+/// cut short since a hook's stderr can run to megabytes; the data keeps all of it.
 fn pre_tool_use_refusal(reason: impl Into<String>) -> acp::Error {
+    const MESSAGE_REASON_LIMIT: usize = 4096;
     let reason = reason.into();
-    let mut error = acp::Error::internal_error().data(reason.clone());
-    error.message = format!("Refused by Zed's PreToolUse hooks: {reason}");
+    let shown_reason = match reason.char_indices().nth(MESSAGE_REASON_LIMIT) {
+        Some((end, _)) => format!(
+            "{}… (the full reason is in the error's data)",
+            &reason[..end]
+        ),
+        None => reason.clone(),
+    };
+    let mut error = acp::Error::internal_error().data(reason);
+    error.message = format!("Zed's PreToolUse hooks block this: {shown_reason}");
     error
 }
 
