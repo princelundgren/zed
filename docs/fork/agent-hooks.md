@@ -62,14 +62,16 @@ mostly in `crates/agent_servers/src/hooks.rs`, `hooks/` and `acp/v1.rs`.
     read it through Zed, so two approved writes can't merge into text no hook saw.
 12. **An agent with hooks stays on ACP v1.** The v2 client runs no hooks yet, so an agent with any
     hook connects over v1 rather than silently losing them.
+13. **A refusal carries its reason in the error message.** Agents show an ACP error's message,
+    not its data, so a refused terminal or write returns code -32603 with the message
+    `Zed's PreToolUse hooks block this: <reason>`, the reason cut to 4096 characters, and the
+    whole reason as the data.
 
 ## What it can't do
 
 - **Hooks see only what passes through Zed:** shell commands it runs and files it writes. MCP
   calls, web fetches, an agent's own reads and files an agent writes without Zed never reach a
   hook. Every edit arrives as `Write` with the whole new text, never as `Edit`.
-- **A refusal reaches the agent as an ACP error whose message is "Internal error"**; the hook's
-  reason is in the error's `data`, which an agent may not show.
 - **Paths:** the part of a path that doesn't exist yet isn't case-corrected, so a guard on a
   case-insensitive disk must compare names without regard to case. A symlink swapped between
   the hook and the write, or a hard link, isn't seen.
